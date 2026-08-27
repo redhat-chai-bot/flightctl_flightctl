@@ -1,6 +1,7 @@
 package tasks
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	_ "crypto/sha256"
@@ -12,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +27,7 @@ import (
 	deltastore "github.com/flightctl/flightctl/internal/store/delta"
 	"github.com/flightctl/flightctl/internal/store/model"
 	"github.com/flightctl/flightctl/internal/worker_client"
+	"github.com/google/uuid"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"oras.land/oras-go/v2"
@@ -37,32 +41,64 @@ import (
 const persistTimeout = 5 * time.Second
 
 type generationJob struct {
-	Key deltastore.GenerationKey
+	Key     deltastore.GenerationKey
+	Timeout time.Duration
 }
 
-type generateDeltaPayload struct {
+type GenerateDeltaPayload struct {
 	ImageRepository string `json:"imageRepository"`
 	SourceDigest    string `json:"sourceDigest"`
 	TargetDigest    string `json:"targetDigest"`
+	Timeout         string `json:"timeout,omitempty"`
 }
 
-func parseGenerationJob(ev worker_client.EventWithOrgId) (generationJob, bool) {
+// GenerationProgress reports in-flight delta generation work for fleet/device status.
+type GenerationProgress struct {
+	Phase      domain.DeltaGenerationPhase
+	Percent    *int64
+	BytesDone  *int64
+	BytesTotal *int64
+	ItemsDone  *int64
+	ItemsTotal *int64
+}
+
+type PrepareDeltasHandler interface {
+	Prepare(ctx context.Context, ev worker_client.EventWithOrgId) error
+}
+
+type preparingStatusReporter interface {
+	SetProgress(ctx context.Context, orgId uuid.UUID, kind, name string, progress GenerationProgress) error
+}
+
+type writeTargetResolver func(ctx context.Context, orgID uuid.UUID) (*domain.OciRepoSpec, error)
+type pushPathResolver func(ctx context.Context, orgID uuid.UUID, imageRepository string) (string, error)
+
+func parseGenerationJob(ev worker_client.EventWithOrgId) (generationJob, bool, error) {
 	if ev.Event.Reason != domain.EventReasonGenerateDelta {
-		return generationJob{}, false
+		return generationJob{}, false, nil
 	}
-	var payload generateDeltaPayload
+	var payload GenerateDeltaPayload
 	if err := json.Unmarshal([]byte(ev.Event.Message), &payload); err != nil {
-		return generationJob{}, false
+		return generationJob{}, false, nil
 	}
 	if payload.ImageRepository == "" || payload.SourceDigest == "" || payload.TargetDigest == "" {
-		return generationJob{}, false
+		return generationJob{}, false, nil
 	}
-	return generationJob{Key: deltastore.GenerationKey{
+	job := generationJob{Key: deltastore.GenerationKey{
 		OrgID:           ev.OrgId,
 		ImageRepository: payload.ImageRepository,
 		SourceDigest:    payload.SourceDigest,
 		TargetDigest:    payload.TargetDigest,
-	}}, true
+	}}
+	if payload.Timeout == "" {
+		return job, true, nil
+	}
+	d, err := time.ParseDuration(payload.Timeout)
+	if err != nil {
+		return generationJob{}, false, fmt.Errorf("generate delta timeout: %w", err)
+	}
+	job.Timeout = d
+	return job, true, nil
 }
 
 func (c *Consumer) effectiveTimeout() time.Duration {
@@ -76,28 +112,49 @@ func (c *Consumer) effectiveTimeout() time.Duration {
 	return timeout
 }
 
-func (c *Consumer) defaultExistenceCheck(ctx context.Context, imageRepository, sourceDigest, targetDigest string) (existenceResult, error) {
-	existCfg, err := existenceConfigFromSpec(ctx, writeSpecFromConfig(c.cfg), imageRepository)
+func (c *Consumer) resolveWriteSpec(ctx context.Context, orgID uuid.UUID) (*domain.OciRepoSpec, error) {
+	if c.writeTarget != nil {
+		return c.writeTarget(ctx, orgID)
+	}
+	return WriteSpecFromConfig(c.cfg), nil
+}
+
+func (c *Consumer) defaultExistenceCheck(ctx context.Context, orgID uuid.UUID, imageRepository, sourceDigest, targetDigest string) (existenceResult, error) {
+	spec, err := c.resolveWriteSpec(ctx, orgID)
+	if err != nil {
+		return existenceResult{}, err
+	}
+	existCfg, err := ExistenceConfigFromSpec(ctx, spec, imageRepository)
 	if err != nil {
 		return existenceResult{}, err
 	}
 	return checkExistingDelta(ctx, imageRepository, sourceDigest, targetDigest, existCfg)
 }
 
-func (c *Consumer) defaultGenerateDelta(ctx context.Context, sourceRef, targetRef, pushPath string) (string, int64, error) {
-	g := generator{run: execRunner{}, writeSpec: writeSpecFromConfig(c.cfg), log: c.log}
+func (c *Consumer) defaultGenerateDelta(ctx context.Context, orgID uuid.UUID, sourceRef, targetRef, pushPath string) (string, int64, error) {
+	spec, err := c.resolveWriteSpec(ctx, orgID)
+	if err != nil {
+		return "", 0, err
+	}
+	g := generator{run: execRunner{}, writeSpec: spec, log: c.log}
 	return g.createAndPushDelta(ctx, sourceRef, targetRef, pushPath)
 }
 
-func (c *Consumer) defaultPushPath(imageRepository string) (string, error) {
-	spec := writeSpecFromConfig(c.cfg)
+func (c *Consumer) defaultPushPath(ctx context.Context, orgID uuid.UUID, imageRepository string) (string, error) {
+	if c.pushPath != nil {
+		return c.pushPath(ctx, orgID, imageRepository)
+	}
+	spec, err := c.resolveWriteSpec(ctx, orgID)
+	if err != nil {
+		return "", err
+	}
 	if spec == nil {
 		return "", fmt.Errorf("deltaGeneration.defaultRepository is required to push")
 	}
 	return oci.ResolveDeltaPushPath(spec, imageRepository)
 }
 
-func writeSpecFromConfig(cfg *config.Config) *domain.OciRepoSpec {
+func WriteSpecFromConfig(cfg *config.Config) *domain.OciRepoSpec {
 	if cfg == nil || cfg.DeltaGeneration == nil || cfg.DeltaGeneration.DefaultRepository == nil {
 		return nil
 	}
@@ -108,17 +165,33 @@ func writeSpecFromConfig(cfg *config.Config) *domain.OciRepoSpec {
 	return oci.SelectWriteTarget(nil, spec)
 }
 
-func (c *Consumer) handleGenerateDelta(ctx context.Context, ev worker_client.EventWithOrgId, log logrus.FieldLogger) error {
+func (c *Consumer) handlePrepareDeltas(ctx context.Context, ev worker_client.EventWithOrgId, log logrus.FieldLogger) error {
+	if c.preparer == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, c.effectiveTimeout())
 	defer cancel()
+	log.Infof("preparing deltas for %s/%s", ev.Event.InvolvedObject.Kind, ev.Event.InvolvedObject.Name)
+	return c.preparer.Prepare(ctx, ev)
+}
 
-	job, ok := parseGenerationJob(ev)
+func (c *Consumer) handleGenerateDelta(ctx context.Context, ev worker_client.EventWithOrgId, log logrus.FieldLogger) error {
+	job, ok, err := parseGenerationJob(ev)
+	if err != nil {
+		return err
+	}
 	if !ok {
 		if ev.Event.Reason == domain.EventReasonGenerateDelta {
 			log.Warnf("ignoring GenerateDelta: payload not parseable org=%s message=%q", ev.OrgId, ev.Event.Message)
 		}
 		return nil
 	}
+	timeout := c.effectiveTimeout()
+	if job.Timeout > 0 {
+		timeout = job.Timeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	if c.store == nil {
 		return nil
 	}
@@ -130,7 +203,9 @@ func (c *Consumer) handleGenerateDelta(ctx context.Context, ev worker_client.Eve
 	if check == nil {
 		check = c.defaultExistenceCheck
 	}
-	result, err := check(ctx, key.ImageRepository, key.SourceDigest, key.TargetDigest)
+	stopCheck := c.heartbeatPrepareProgress(ctx, key, domain.DeltaGenerationPhaseCheckingExisting, log)
+	result, err := check(ctx, key.OrgID, key.ImageRepository, key.SourceDigest, key.TargetDigest)
+	stopCheck()
 	if err != nil {
 		return err
 	}
@@ -141,12 +216,9 @@ func (c *Consumer) handleGenerateDelta(ctx context.Context, ev worker_client.Eve
 	if result.Status == existenceFound {
 		size := result.SizeBytes
 		if err := c.store.InsertRejectedGeneration(ctx, &model.DeltaGeneration{
-			OrgID:           key.OrgID,
-			ImageRepository: key.ImageRepository,
-			SourceDigest:    key.SourceDigest,
-			TargetDigest:    key.TargetDigest,
-			Status:          model.DeltaGenerationRejected,
-			SizeBytes:       &size,
+			OrgID: key.OrgID, ImageRepository: key.ImageRepository,
+			SourceDigest: key.SourceDigest, TargetDigest: key.TargetDigest,
+			Status: model.DeltaGenerationRejected, SizeBytes: &size,
 		}); err != nil {
 			return err
 		}
@@ -154,10 +226,8 @@ func (c *Consumer) handleGenerateDelta(ctx context.Context, ev worker_client.Eve
 	}
 
 	if _, err := c.store.InsertGenerations(ctx, []*model.DeltaGeneration{{
-		OrgID:           key.OrgID,
-		ImageRepository: key.ImageRepository,
-		SourceDigest:    key.SourceDigest,
-		TargetDigest:    key.TargetDigest,
+		OrgID: key.OrgID, ImageRepository: key.ImageRepository,
+		SourceDigest: key.SourceDigest, TargetDigest: key.TargetDigest,
 	}}); err != nil {
 		return err
 	}
@@ -173,9 +243,14 @@ func (c *Consumer) handleGenerateDelta(ctx context.Context, ev worker_client.Eve
 
 	pushPath := key.ImageRepository
 	if c.pushPath != nil {
-		pushPath, err = c.pushPath(key.ImageRepository)
-	} else if writeSpecFromConfig(c.cfg) != nil {
-		pushPath, err = c.defaultPushPath(key.ImageRepository)
+		pushPath, err = c.pushPath(ctx, key.OrgID, key.ImageRepository)
+	} else {
+		spec, specErr := c.resolveWriteSpec(ctx, key.OrgID)
+		if specErr != nil {
+			err = specErr
+		} else if spec != nil {
+			pushPath, err = oci.ResolveDeltaPushPath(spec, key.ImageRepository)
+		}
 	}
 	if err != nil {
 		return c.failGeneration(ctx, key, claimed.ResourceVersion, err)
@@ -188,7 +263,17 @@ func (c *Consumer) handleGenerateDelta(ctx context.Context, ev worker_client.Eve
 	sourceRef := key.ImageRepository + "@" + key.SourceDigest
 	targetRef := key.ImageRepository + "@" + key.TargetDigest
 	log.Infof("creating delta source=%s target=%s push=%s", sourceRef, targetRef, pushPath)
-	deltaRef, sizeBytes, genErr := generate(ctx, sourceRef, targetRef, pushPath)
+	var lastMu sync.Mutex
+	var last GenerationProgress
+	genCtx := withCopyProgress(ctx, func(prog GenerationProgress) {
+		lastMu.Lock()
+		last = prog
+		lastMu.Unlock()
+		c.reportCopyProgress(ctx, key, prog, log)
+	})
+	stopGen := c.heartbeatLastProgress(ctx, key, &lastMu, &last, log)
+	defer stopGen()
+	deltaRef, sizeBytes, genErr := generate(genCtx, key.OrgID, sourceRef, targetRef, pushPath)
 	if genErr != nil {
 		return c.failGeneration(ctx, key, claimed.ResourceVersion, genErr)
 	}
@@ -197,9 +282,7 @@ func (c *Consumer) handleGenerateDelta(ctx context.Context, ev worker_client.Eve
 	writeCtx, writeCancel := persistContext(ctx)
 	defer writeCancel()
 	casErr := c.store.CASGeneration(writeCtx, key, claimed.ResourceVersion, deltastore.GenerationCAS{
-		Status:    model.DeltaGenerationSucceeded,
-		DeltaRef:  &deltaRef,
-		SizeBytes: &sizeBytes,
+		Status: model.DeltaGenerationSucceeded, DeltaRef: &deltaRef, SizeBytes: &sizeBytes,
 	})
 	if casErr != nil {
 		if errors.Is(casErr, flterrors.ErrNoRowsUpdated) {
@@ -233,6 +316,60 @@ func (c *Consumer) runResume(ctx context.Context, key deltastore.GenerationKey) 
 	return err
 }
 
+func (c *Consumer) reportCopyProgress(ctx context.Context, key deltastore.GenerationKey, progress GenerationProgress, log logrus.FieldLogger) {
+	if c.preparingStatus == nil || c.store == nil {
+		return
+	}
+	waiting, err := c.store.ListWaitingPreparesByGeneration(ctx, key)
+	if err != nil {
+		if log != nil {
+			log.WithError(err).Warn("failed to list prepares for copy progress")
+		}
+		return
+	}
+	for i := range waiting {
+		prep := waiting[i]
+		if err := c.preparingStatus.SetProgress(ctx, prep.OrgID, prep.Kind, prep.Name, progress); err != nil && log != nil {
+			log.WithError(err).Warnf("failed to update copy progress for %s/%s", prep.Kind, prep.Name)
+		}
+	}
+}
+
+func (c *Consumer) heartbeatPrepareProgress(ctx context.Context, key deltastore.GenerationKey, phase domain.DeltaGenerationPhase, log logrus.FieldLogger) context.CancelFunc {
+	progress := GenerationProgress{Phase: phase}
+	c.reportCopyProgress(ctx, key, progress, log)
+	return c.tickProgress(ctx, func() { c.reportCopyProgress(ctx, key, progress, log) })
+}
+
+func (c *Consumer) heartbeatLastProgress(ctx context.Context, key deltastore.GenerationKey, mu *sync.Mutex, last *GenerationProgress, log logrus.FieldLogger) context.CancelFunc {
+	return c.tickProgress(ctx, func() {
+		mu.Lock()
+		cur := *last
+		mu.Unlock()
+		if cur.Phase == "" {
+			return
+		}
+		c.reportCopyProgress(ctx, key, cur, log)
+	})
+}
+
+func (c *Consumer) tickProgress(ctx context.Context, fn func()) context.CancelFunc {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		t := time.NewTicker(copyProgressInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				fn()
+			}
+		}
+	}()
+	return cancel
+}
+
 const (
 	ociDeltaArtifactType     = "application/vnd.io.github.containers.oci-delta.v1"
 	ociDeltaSourceAnnotation = "io.github.containers.delta.source"
@@ -262,19 +399,19 @@ type existenceResult struct {
 	SizeBytes int64
 }
 
-type existenceConfig struct {
+type ExistenceConfig struct {
 	Client   *http.Client
 	Scheme   string
 	Username string
 	Password string
 }
 
-func checkExistingDelta(ctx context.Context, imageRepository, sourceDigest, targetDigest string, cfg existenceConfig) (existenceResult, error) {
+func checkExistingDelta(ctx context.Context, imageRepository, sourceDigest, targetDigest string, cfg ExistenceConfig) (existenceResult, error) {
 	rewritten, err := oci.RewriteImageRef(imageRepository)
 	if err != nil {
 		return existenceResult{}, err
 	}
-	host, repo, err := splitRegistryRepository(rewritten)
+	host, repo, err := SplitRegistryRepository(rewritten)
 	if err != nil {
 		return existenceResult{Status: existenceInconclusive}, nil
 	}
@@ -311,7 +448,7 @@ func checkExistingDelta(ctx context.Context, imageRepository, sourceDigest, targ
 	return fetchDeltaSize(ctx, client, cfg, scheme, host, repo, desc.Digest.String())
 }
 
-func checkTagSchema(ctx context.Context, client *http.Client, cfg existenceConfig, scheme, host, repo, sourceDigest, targetDigest string) (existenceResult, error) {
+func checkTagSchema(ctx context.Context, client *http.Client, cfg ExistenceConfig, scheme, host, repo, sourceDigest, targetDigest string) (existenceResult, error) {
 	status, body, err := registryGet(ctx, client, cfg, fmt.Sprintf("%s://%s/v2/%s/manifests/%s", scheme, host, repo, tagSchemaRef(targetDigest)))
 	if err != nil {
 		return existenceResult{Status: existenceInconclusive}, nil
@@ -336,7 +473,7 @@ func checkTagSchema(ctx context.Context, client *http.Client, cfg existenceConfi
 	return fetchDeltaSize(ctx, client, cfg, scheme, host, repo, desc.Digest.String())
 }
 
-func fetchDeltaSize(ctx context.Context, client *http.Client, cfg existenceConfig, scheme, host, repo, digest string) (existenceResult, error) {
+func fetchDeltaSize(ctx context.Context, client *http.Client, cfg ExistenceConfig, scheme, host, repo, digest string) (existenceResult, error) {
 	status, body, err := registryGet(ctx, client, cfg, fmt.Sprintf("%s://%s/v2/%s/manifests/%s", scheme, host, repo, digest))
 	if err != nil {
 		return existenceResult{Status: existenceInconclusive}, nil
@@ -375,7 +512,7 @@ func matchingDeltaDescriptor(indexBody []byte, sourceDigest string) (ocispec.Des
 	return ocispec.Descriptor{}, false, nil
 }
 
-func registryGet(ctx context.Context, client *http.Client, cfg existenceConfig, rawURL string) (int, []byte, error) {
+func registryGet(ctx context.Context, client *http.Client, cfg ExistenceConfig, rawURL string) (int, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return 0, nil, err
@@ -403,7 +540,7 @@ func tagSchemaRef(digest string) string {
 	return strings.Replace(digest, ":", "-", 1)
 }
 
-func splitRegistryRepository(imageRepository string) (host, repo string, err error) {
+func SplitRegistryRepository(imageRepository string) (host, repo string, err error) {
 	host, repo, ok := strings.Cut(imageRepository, "/")
 	if !ok || host == "" || repo == "" {
 		return "", "", fmt.Errorf("unparseable image repository %q", imageRepository)
@@ -427,13 +564,13 @@ func tlsSummary(spec *domain.OciRepoSpec) string {
 	return fmt.Sprintf("registry=%s scheme=%s skipTLS=%t ca=%t auth=%t", spec.Registry, scheme, skip, spec.CaCrt != nil, spec.OciAuth != nil)
 }
 
-func existenceConfigFromSpec(ctx context.Context, spec *domain.OciRepoSpec, imageRepository string) (existenceConfig, error) {
-	out := existenceConfig{Scheme: "https", Client: &http.Client{Timeout: 30 * time.Second}}
+func ExistenceConfigFromSpec(ctx context.Context, spec *domain.OciRepoSpec, imageRepository string) (ExistenceConfig, error) {
+	out := ExistenceConfig{Scheme: "https", Client: &http.Client{Timeout: 30 * time.Second}}
 	rewritten, err := oci.RewriteImageRef(imageRepository)
 	if err != nil {
-		return existenceConfig{}, err
+		return ExistenceConfig{}, err
 	}
-	host, _, err := splitRegistryRepository(rewritten)
+	host, _, err := SplitRegistryRepository(rewritten)
 	if err != nil {
 		return out, nil
 	}
@@ -443,12 +580,12 @@ func existenceConfigFromSpec(ctx context.Context, spec *domain.OciRepoSpec, imag
 	}
 	client, err := httpClientForSpec(effective)
 	if err != nil {
-		return existenceConfig{}, err
+		return ExistenceConfig{}, err
 	}
 	out.Client = client
 	user, pass, err := credentialsFromSpec(ctx, effective)
 	if err != nil {
-		return existenceConfig{}, err
+		return ExistenceConfig{}, err
 	}
 	out.Username = user
 	out.Password = pass
@@ -500,7 +637,7 @@ func withCopyLog(ctx context.Context, log logrus.FieldLogger) context.Context {
 	return context.WithValue(ctx, copyLogKey{}, log)
 }
 
-func withCopyProgress(ctx context.Context, fn func(string)) context.Context {
+func withCopyProgress(ctx context.Context, fn func(GenerationProgress)) context.Context {
 	if fn == nil {
 		return ctx
 	}
@@ -516,35 +653,50 @@ func withCopyOp(ctx context.Context, op string) context.Context {
 
 type copyObserver struct {
 	log      logrus.FieldLogger
-	progress func(string)
+	progress func(GenerationProgress)
 	op       string
+	phase    domain.DeltaGenerationPhase
 
 	mu   sync.Mutex
 	last time.Time
 }
 
 func copyObserverFrom(ctx context.Context) *copyObserver {
-	obs := &copyObserver{op: "copy"}
+	obs := &copyObserver{}
 	if log, ok := ctx.Value(copyLogKey{}).(logrus.FieldLogger); ok {
 		obs.log = log
 	}
-	if fn, ok := ctx.Value(copyProgressFnKey{}).(func(string)); ok {
+	if fn, ok := ctx.Value(copyProgressFnKey{}).(func(GenerationProgress)); ok {
 		obs.progress = fn
 	}
 	if op, ok := ctx.Value(copyOpKey{}).(string); ok && op != "" {
 		obs.op = op
+		obs.phase = phaseFromCopyOp(op)
 	}
 	return obs
+}
+
+func phaseFromCopyOp(op string) domain.DeltaGenerationPhase {
+	switch op {
+	case "pull source":
+		return domain.DeltaGenerationPhasePullSource
+	case "pull target":
+		return domain.DeltaGenerationPhasePullTarget
+	case "push":
+		return domain.DeltaGenerationPhasePush
+	default:
+		return ""
+	}
 }
 
 func (o *copyObserver) copyOptions() oras.CopyOptions {
 	opts := oras.DefaultCopyOptions
 	opts.PreCopy = func(_ context.Context, desc ocispec.Descriptor) error {
-		o.emit(fmt.Sprintf("%s %s %s %s", o.op, blobLabel(desc), formatBytes(desc.Size), desc.Digest), true)
+		o.emit(blobProgress(o.phase, 0, desc.Size), fmt.Sprintf("%s %s %s %s", o.op, blobLabel(desc), formatBytes(desc.Size), desc.Digest), true)
 		return nil
 	}
 	opts.PostCopy = func(_ context.Context, desc ocispec.Descriptor) error {
-		o.emit(fmt.Sprintf("%s %s complete %s %s", o.op, blobLabel(desc), formatBytes(desc.Size), desc.Digest), true)
+		o.emit(blobProgress(o.phase, desc.Size, desc.Size), fmt.Sprintf("%s %s complete %s %s", o.op, blobLabel(desc), formatBytes(desc.Size), desc.Digest), true)
 		return nil
 	}
 	opts.OnCopySkipped = func(_ context.Context, desc ocispec.Descriptor) error {
@@ -560,12 +712,22 @@ func (o *copyObserver) bytesCopied(desc ocispec.Descriptor, n int64) {
 	if desc.Size <= 0 {
 		return
 	}
-	pct := n * 100 / desc.Size
 	force := n == desc.Size
-	o.emit(fmt.Sprintf("%s %s %d%% (%s/%s)", o.op, blobLabel(desc), pct, formatBytes(n), formatBytes(desc.Size)), force)
+	o.emit(blobProgress(o.phase, n, desc.Size), fmt.Sprintf("%s %s %d%% (%s/%s)", o.op, blobLabel(desc), n*100/desc.Size, formatBytes(n), formatBytes(desc.Size)), force)
 }
 
-func (o *copyObserver) emit(msg string, force bool) {
+func blobProgress(phase domain.DeltaGenerationPhase, done, total int64) GenerationProgress {
+	p := GenerationProgress{Phase: phase}
+	if total > 0 {
+		pct := done * 100 / total
+		p.Percent = &pct
+		p.BytesDone = &done
+		p.BytesTotal = &total
+	}
+	return p
+}
+
+func (o *copyObserver) emit(p GenerationProgress, msg string, force bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	now := time.Now()
@@ -573,11 +735,11 @@ func (o *copyObserver) emit(msg string, force bool) {
 		return
 	}
 	o.last = now
-	if o.log != nil {
+	if o.log != nil && msg != "" {
 		o.log.Info(msg)
 	}
 	if o.progress != nil {
-		o.progress(msg)
+		o.progress(p)
 	}
 }
 
@@ -602,6 +764,54 @@ func wrapFetchProgress(src oras.ReadOnlyGraphTarget, obs *copyObserver) oras.Rea
 		return src
 	}
 	return fetchProgressTarget{ReadOnlyGraphTarget: src, obs: obs}
+}
+
+func emitGenerationProgress(ctx context.Context, p GenerationProgress) {
+	fn, ok := ctx.Value(copyProgressFnKey{}).(func(GenerationProgress))
+	if !ok || fn == nil {
+		return
+	}
+	fn(p)
+}
+
+var (
+	ociDeltaLayerRe = regexp.MustCompile(`Computing diff for layer (\d+)/(\d+)`)
+	ociDeltaTotalRe = regexp.MustCompile(`Layers with new content \(will process\): (\d+)`)
+)
+
+func parseOciDeltaCreateLine(line string) (GenerationProgress, bool) {
+	if m := ociDeltaLayerRe.FindStringSubmatch(line); len(m) == 3 {
+		done, err := strconv.ParseInt(m[1], 10, 64)
+		if err != nil {
+			return GenerationProgress{}, false
+		}
+		total, err := strconv.ParseInt(m[2], 10, 64)
+		if err != nil || total <= 0 {
+			return GenerationProgress{}, false
+		}
+		pct := done * 100 / total
+		return GenerationProgress{
+			Phase:      domain.DeltaGenerationPhaseCreateDelta,
+			Percent:    &pct,
+			ItemsDone:  &done,
+			ItemsTotal: &total,
+		}, true
+	}
+	if m := ociDeltaTotalRe.FindStringSubmatch(line); len(m) == 2 {
+		total, err := strconv.ParseInt(m[1], 10, 64)
+		if err != nil {
+			return GenerationProgress{}, false
+		}
+		zero := int64(0)
+		pct := int64(0)
+		return GenerationProgress{
+			Phase:      domain.DeltaGenerationPhaseCreateDelta,
+			Percent:    &pct,
+			ItemsDone:  &zero,
+			ItemsTotal: &total,
+		}, true
+	}
+	return GenerationProgress{}, false
 }
 
 type progressReadCloser struct {
@@ -649,16 +859,49 @@ func formatBytes(n int64) string {
 const layoutTag = "img"
 
 type runner interface {
-	Run(ctx context.Context, name string, args ...string) error
+	Run(ctx context.Context, name string, args []string, onLine func(string)) error
 }
 
 type execRunner struct{}
 
-func (execRunner) Run(ctx context.Context, name string, args ...string) error {
+func (execRunner) Run(ctx context.Context, name string, args []string, onLine func(string)) error {
 	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.CombinedOutput()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("%s: %w: %s", name, err, out)
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	var (
+		mu  sync.Mutex
+		out strings.Builder
+		wg  sync.WaitGroup
+	)
+	scan := func(r io.Reader) {
+		defer wg.Done()
+		s := bufio.NewScanner(r)
+		for s.Scan() {
+			line := s.Text()
+			mu.Lock()
+			out.WriteString(line)
+			out.WriteByte('\n')
+			mu.Unlock()
+			if onLine != nil {
+				onLine(line)
+			}
+		}
+	}
+	wg.Add(2)
+	go scan(stdout)
+	go scan(stderr)
+	wg.Wait()
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("%s: %w: %s", name, err, out.String())
 	}
 	return nil
 }
@@ -713,17 +956,27 @@ func (g generator) createAndPushDelta(ctx context.Context, sourceRef, targetRef,
 		}
 	}
 	g.info("pulling source %s tls=%s", sourceRef, tlsSummaryForImage(sourceRef, g.writeSpec))
+	emitGenerationProgress(ctx, GenerationProgress{Phase: domain.DeltaGenerationPhasePullSource})
 	if err := pull(withCopyOp(ctx, "pull source"), sourceRef, sourceDir); err != nil {
 		return "", 0, fmt.Errorf("pull source: %w", err)
 	}
 	g.info("pulled source %s", sourceRef)
 	g.info("pulling target %s tls=%s", targetRef, tlsSummaryForImage(targetRef, g.writeSpec))
+	emitGenerationProgress(ctx, GenerationProgress{Phase: domain.DeltaGenerationPhasePullTarget})
 	if err := pull(withCopyOp(ctx, "pull target"), targetRef, targetDir); err != nil {
 		return "", 0, fmt.Errorf("pull target: %w", err)
 	}
 	g.info("pulled target %s", targetRef)
 	g.info("creating oci-delta")
-	if err := run.Run(ctx, "oci-delta", "create", sourceOCI, targetOCI, deltaOCI); err != nil {
+	emitGenerationProgress(ctx, GenerationProgress{Phase: domain.DeltaGenerationPhaseCreateDelta})
+	onLine := func(line string) {
+		p, ok := parseOciDeltaCreateLine(line)
+		if !ok {
+			return
+		}
+		emitGenerationProgress(ctx, p)
+	}
+	if err := run.Run(ctx, "oci-delta", []string{"create", "--debug", sourceOCI, targetOCI, deltaOCI}, onLine); err != nil {
 		return "", 0, fmt.Errorf("create delta: %w", err)
 	}
 	g.info("created oci-delta")
@@ -735,6 +988,7 @@ func (g generator) createAndPushDelta(ctx context.Context, sourceRef, targetRef,
 		}
 	}
 	g.info("pushing delta to %s tls=%s", pushPath, tlsSummary(g.writeSpec))
+	emitGenerationProgress(ctx, GenerationProgress{Phase: domain.DeltaGenerationPhasePush})
 	deltaRef, err = push(withCopyOp(ctx, "push"), deltaDir, pushPath, sourceRef, targetRef)
 	if err != nil {
 		return "", 0, fmt.Errorf("push delta: %w", err)
@@ -954,7 +1208,7 @@ func pushStoredBlob(ctx context.Context, src content.Fetcher, dst content.Pusher
 	}
 	defer rc.Close()
 	if obs != nil {
-		obs.emit(fmt.Sprintf("%s %s %s %s", obs.op, blobLabel(desc), formatBytes(desc.Size), desc.Digest), true)
+		obs.emit(blobProgress(obs.phase, 0, desc.Size), fmt.Sprintf("%s %s %s %s", obs.op, blobLabel(desc), formatBytes(desc.Size), desc.Digest), true)
 	}
 	if err := dst.Push(ctx, desc, rc); err != nil {
 		if errors.Is(err, errdef.ErrAlreadyExists) {
@@ -963,7 +1217,7 @@ func pushStoredBlob(ctx context.Context, src content.Fetcher, dst content.Pusher
 		return err
 	}
 	if obs != nil {
-		obs.emit(fmt.Sprintf("%s %s complete %s %s", obs.op, blobLabel(desc), formatBytes(desc.Size), desc.Digest), true)
+		obs.emit(blobProgress(obs.phase, desc.Size, desc.Size), fmt.Sprintf("%s %s complete %s %s", obs.op, blobLabel(desc), formatBytes(desc.Size), desc.Digest), true)
 	}
 	return nil
 }
