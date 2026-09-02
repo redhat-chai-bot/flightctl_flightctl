@@ -126,9 +126,7 @@ func validateArtifacts(artifacts []CatalogItemArtifact, pathPrefix string) []err
 			allErrs = append(allErrs, fmt.Errorf("%s.uri is required", artPath))
 		} else {
 			allErrs = append(allErrs, validateArtifactURI(artifact.Uri, artPath+".uri")...)
-			if artifact.Type != "" {
-				allErrs = append(allErrs, validateArtifactURIHasNoVersionQualifier(artifact.Uri, artPath+".uri")...)
-			}
+			allErrs = append(allErrs, validateArtifactURIHasNoVersionQualifier(artifact.Uri, artPath+".uri")...)
 		}
 	}
 
