@@ -689,6 +689,7 @@ func (m *PodmanMonitor) updateApplicationStatus(app Application, event *client.P
 	m.log.Debugf("Adding container: %s to app %s", event.Name, app.Name())
 	app.AddWorkload(&Workload{
 		ID:       event.ID,
+		Image:    event.Image,
 		Name:     event.Name,
 		Status:   status,
 		Restarts: restarts,

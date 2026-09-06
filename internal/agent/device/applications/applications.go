@@ -136,10 +136,12 @@ type Application interface {
 
 // Workload represents an application workload tracked by a Monitor.
 type Workload struct {
-	ID       string
-	Image    string
-	Name     string
-	Status   StatusType
+	ID     string
+	Image  string
+	Digest string
+	Name   string
+	Status StatusType
+	// Restarts counts the number of container restarts observed for this workload.
 	Restarts int
 	// RequiresHealth is set when a VM workload has emitted health_status events.
 	// Gated workloads stay Degraded on start/starting until healthy.
@@ -419,7 +421,8 @@ func (a *application) collectImageDigests() {
 		})
 	}
 
-	// Workload container images from the runtime.
+	// Workload container images from the runtime. The image ref comes from
+	// the container event; the digest is set when available.
 	for _, w := range a.workloads {
 		if w.Image == "" {
 			continue
@@ -429,7 +432,8 @@ func (a *application) collectImageDigests() {
 		}
 		seen[w.Image] = struct{}{}
 		digests = append(digests, v1beta1.ApplicationImageDigest{
-			Image: w.Image,
+			Image:  w.Image,
+			Digest: w.Digest,
 		})
 	}
 
