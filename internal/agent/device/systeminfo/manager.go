@@ -35,12 +35,13 @@ type manager struct {
 	readWriter fileio.ReadWriter
 	dataDir    string
 
-	mu                sync.Mutex
-	infoKeys          []string
-	customKeys        []string
-	collectionTimeout time.Duration
-	collectors        map[string]CollectorFn
-	collected         bool
+	mu                 sync.Mutex
+	infoKeys           []string
+	customKeys         []string
+	collectionTimeout  time.Duration
+	collectionInterval time.Duration
+	collectors         map[string]CollectorFn
+	cachedSystemInfo   *v1beta1.DeviceSystemInfo
 
 	log *log.PrefixLogger
 }
@@ -53,16 +54,18 @@ func NewManager(
 	infoKeys []string,
 	customKeys []string,
 	collectionTimeout util.Duration,
+	collectionInterval util.Duration,
 ) *manager {
 	return &manager{
-		exec:              exec,
-		readWriter:        readWriter,
-		dataDir:           dataDir,
-		infoKeys:          infoKeys,
-		customKeys:        customKeys,
-		collectionTimeout: time.Duration(collectionTimeout),
-		collectors:        make(map[string]CollectorFn),
-		log:               log,
+		exec:               exec,
+		readWriter:         readWriter,
+		dataDir:            dataDir,
+		infoKeys:           infoKeys,
+		customKeys:         customKeys,
+		collectionTimeout:  time.Duration(collectionTimeout),
+		collectionInterval: time.Duration(collectionInterval),
+		collectors:         make(map[string]CollectorFn),
+		log:                log,
 	}
 }
 
@@ -170,7 +173,7 @@ func (m *manager) ReloadConfig(ctx context.Context, cfg *config.Config) error {
 		}
 
 		if hasNewCollectors {
-			m.collected = false
+			m.cachedSystemInfo = nil
 		}
 	}
 
@@ -200,35 +203,84 @@ func (m *manager) BootTime() string {
 	return m.bootTime
 }
 
-func (m *manager) Status(ctx context.Context, deviceStatus *v1beta1.DeviceStatus, opts ...status.CollectorOpt) error {
-	collectorOpts := status.CollectorOpts{}
-	for _, opt := range opts {
-		opt(&collectorOpts)
-	}
+// Run starts periodic system info collection in a blocking loop.
+// It performs an initial collection immediately, then collects again
+// at each collectionInterval tick. Stops when ctx is cancelled.
+func (m *manager) Run(ctx context.Context) {
+	m.log.Debugf("Starting systeminfo collection loop (interval=%s)", m.collectionInterval)
+
+	// Initial collection — inline lock→snapshot→unlock→collect→lock→write→unlock
 	m.mu.Lock()
-
-	if m.collected && !collectorOpts.Force {
-		m.mu.Unlock()
-		return nil
+	snap := collectSnapshot{
+		timeout:    m.collectionTimeout,
+		infoKeys:   slices.Clone(m.infoKeys),
+		customKeys: slices.Clone(m.customKeys),
+		collectors: copyCollectors(m.collectors),
 	}
-
-	// set collected to true even if there is an error this is to prevent
-	// collecting system info multiple times
-	m.collected = true
-
-	// reduce scope of the mutex
-	timeout := m.collectionTimeout
-	infoKeys := slices.Clone(m.infoKeys)
-	customKeys := slices.Clone(m.customKeys)
-	bootID := m.bootID
-	collectors := make(map[string]CollectorFn, len(m.collectors))
-	for k, v := range m.collectors {
-		collectors[k] = v
-	}
-	dataDir := m.dataDir
 	m.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	result := m.collect(ctx, snap)
+
+	m.mu.Lock()
+	m.cachedSystemInfo = result
+	m.mu.Unlock()
+
+	if m.collectionInterval <= 0 {
+		m.log.Debugf("Systeminfo collection complete (single run, no interval)")
+		return
+	}
+
+	ticker := time.NewTicker(m.collectionInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			m.log.Debugf("Systeminfo collection loop stopped")
+			return
+		case <-ticker.C:
+			m.mu.Lock()
+			snap = collectSnapshot{
+				timeout:    m.collectionTimeout,
+				infoKeys:   slices.Clone(m.infoKeys),
+				customKeys: slices.Clone(m.customKeys),
+				collectors: copyCollectors(m.collectors),
+			}
+			m.mu.Unlock()
+
+			result = m.collect(ctx, snap)
+
+			m.mu.Lock()
+			m.cachedSystemInfo = result
+			m.mu.Unlock()
+		}
+	}
+}
+
+// collectSnapshot holds a point-in-time copy of the mutable configuration
+// fields needed by collect(). Callers create this under the mutex before
+// calling the lock-free collect().
+type collectSnapshot struct {
+	timeout    time.Duration
+	infoKeys   []string
+	customKeys []string
+	collectors map[string]CollectorFn
+}
+
+// copyCollectors returns a shallow copy of the collectors map.
+func copyCollectors(src map[string]CollectorFn) map[string]CollectorFn {
+	dst := make(map[string]CollectorFn, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+// collect performs the slow collection work using a pre-snapshotted config.
+// It reads immutable fields (bootID, dataDir, exec, readWriter, log) directly
+// from m.* and does NOT acquire or release the mutex — callers manage all locking.
+func (m *manager) collect(ctx context.Context, snap collectSnapshot) *v1beta1.DeviceSystemInfo {
+	ctx, cancel := context.WithTimeout(ctx, snap.timeout)
 	defer cancel()
 
 	systemInfo, err := collectDeviceSystemInfo(
@@ -236,18 +288,50 @@ func (m *manager) Status(ctx context.Context, deviceStatus *v1beta1.DeviceStatus
 		m.log,
 		m.exec,
 		m.readWriter,
-		infoKeys,
-		customKeys,
-		bootID,
-		collectors,
-		filepath.Join(dataDir, HardwareMapFileName),
+		snap.infoKeys,
+		snap.customKeys,
+		m.bootID,
+		snap.collectors,
+		filepath.Join(m.dataDir, HardwareMapFileName),
 	)
-
 	if err != nil {
-		deviceStatus.SystemInfo = m.defaultSystemInfo()
-		return err
+		m.log.Warnf("System info collection failed: %v", err)
+		defaultInfo := m.defaultSystemInfo()
+		return &defaultInfo
 	}
-	deviceStatus.SystemInfo = systemInfo
+	return &systemInfo
+}
+
+func (m *manager) Status(ctx context.Context, deviceStatus *v1beta1.DeviceStatus, opts ...status.CollectorOpt) error {
+	collectorOpts := status.CollectorOpts{}
+	for _, opt := range opts {
+		opt(&collectorOpts)
+	}
+
+	m.mu.Lock()
+	if m.cachedSystemInfo != nil && !collectorOpts.Force {
+		deviceStatus.SystemInfo = *m.cachedSystemInfo
+		m.mu.Unlock()
+		return nil
+	}
+	// Cache miss or Force — snapshot mutable config under the same lock
+	// that checked the cache, closing the gap between "decided to collect"
+	// and "captured the config to collect with."
+	snap := collectSnapshot{
+		timeout:    m.collectionTimeout,
+		infoKeys:   slices.Clone(m.infoKeys),
+		customKeys: slices.Clone(m.customKeys),
+		collectors: copyCollectors(m.collectors),
+	}
+	m.mu.Unlock()
+
+	// collect() is lock-free — callers manage all locking.
+	result := m.collect(ctx, snap)
+
+	m.mu.Lock()
+	m.cachedSystemInfo = result
+	deviceStatus.SystemInfo = *m.cachedSystemInfo
+	m.mu.Unlock()
 
 	return nil
 }
@@ -304,7 +388,7 @@ func (m *manager) RegisterCollector(ctx context.Context, key string, fn Collecto
 	}
 
 	m.collectors[key] = fn
-	m.collected = false
+	m.cachedSystemInfo = nil
 }
 
 // collectDeviceSystemInfo collects the system information from the device and returns it as a DeviceSystemInfo object.
