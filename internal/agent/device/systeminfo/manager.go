@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -22,7 +21,6 @@ import (
 	"github.com/flightctl/flightctl/internal/util"
 	"github.com/flightctl/flightctl/pkg/executer"
 	"github.com/flightctl/flightctl/pkg/log"
-	"github.com/flightctl/flightctl/pkg/version"
 )
 
 type manager struct {
@@ -257,17 +255,6 @@ func (m *manager) Status(ctx context.Context, deviceStatus *v1beta1.DeviceStatus
 	deviceStatus.SystemInfoStatus = &infoStatus
 
 	return nil
-}
-
-// defaultSystemInfo returns the default system info.
-func (m *manager) defaultSystemInfo() v1beta1.DeviceSystemInfo {
-	return v1beta1.DeviceSystemInfo{
-		BootID:               m.bootID,
-		AgentVersion:         version.Get().String(),
-		OperatingSystem:      runtime.GOOS,
-		Architecture:         runtime.GOARCH,
-		AdditionalProperties: make(map[string]string),
-	}
 }
 
 // RegisterCollector allows the caller to register a collector function for system information.
