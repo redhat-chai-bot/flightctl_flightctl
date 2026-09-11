@@ -23,7 +23,6 @@ import (
 	"github.com/flightctl/flightctl/pkg/executer"
 	"github.com/flightctl/flightctl/pkg/log"
 	"github.com/flightctl/flightctl/pkg/version"
-	"github.com/samber/lo"
 )
 
 type manager struct {
@@ -41,6 +40,10 @@ type manager struct {
 	collectionTimeout time.Duration
 	collectors        map[string]CollectorFn
 	collected         bool
+
+	// sources holds per-source collection state across forced Status() calls.
+	// Populated on first forced collection; nil on fresh manager.
+	sources []cachedSource
 
 	log *log.PrefixLogger
 }
@@ -216,22 +219,23 @@ func (m *manager) Status(ctx context.Context, deviceStatus *v1beta1.DeviceStatus
 	// collecting system info multiple times
 	m.collected = true
 
-	// reduce scope of the mutex
+	// Snapshot config under lock, release before collection (no lock during I/O)
 	timeout := m.collectionTimeout
 	infoKeys := slices.Clone(m.infoKeys)
 	customKeys := slices.Clone(m.customKeys)
 	bootID := m.bootID
-	collectors := make(map[string]CollectorFn, len(m.collectors))
+	runtimeCollectors := make(map[string]CollectorFn, len(m.collectors))
 	for k, v := range m.collectors {
-		collectors[k] = v
+		runtimeCollectors[k] = v
 	}
 	dataDir := m.dataDir
+	currentSources := m.sources
 	m.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	systemInfo, err := collectDeviceSystemInfo(
+	systemInfo, infoStatus, updatedSources := collectAndBuildStatus(
 		ctx,
 		m.log,
 		m.exec,
@@ -239,15 +243,18 @@ func (m *manager) Status(ctx context.Context, deviceStatus *v1beta1.DeviceStatus
 		infoKeys,
 		customKeys,
 		bootID,
-		collectors,
+		runtimeCollectors,
 		filepath.Join(dataDir, HardwareMapFileName),
+		currentSources,
 	)
 
-	if err != nil {
-		deviceStatus.SystemInfo = m.defaultSystemInfo()
-		return err
-	}
+	// Store updated source state back under lock
+	m.mu.Lock()
+	m.sources = updatedSources
+	m.mu.Unlock()
+
 	deviceStatus.SystemInfo = systemInfo
+	deviceStatus.SystemInfoStatus = &infoStatus
 
 	return nil
 }
@@ -305,47 +312,6 @@ func (m *manager) RegisterCollector(ctx context.Context, key string, fn Collecto
 
 	m.collectors[key] = fn
 	m.collected = false
-}
-
-// collectDeviceSystemInfo collects the system information from the device and returns it as a DeviceSystemInfo object.
-func collectDeviceSystemInfo(
-	ctx context.Context,
-	log *log.PrefixLogger,
-	exec executer.Executer,
-	reader fileio.Reader,
-	infoKeys []string,
-	customKeys []string,
-	bootID string,
-	collectors map[string]CollectorFn,
-	hardwareMapPath string,
-) (v1beta1.DeviceSystemInfo, error) {
-	agentVersion := version.Get()
-
-	collectionOpts, err := collectionOptsFromInfoKeys(infoKeys)
-	// Don't block collection for a few unknown keys. Try our best to grab everything we can
-	if err != nil {
-		log.Warnf("Failed to handle system info keys: %v", err)
-	}
-
-	info, err := Collect(ctx, log, exec, reader, customKeys, hardwareMapPath, collectionOpts...)
-	if err != nil {
-		log.Errorf("Failed to collect system info: %v", err)
-		return v1beta1.DeviceSystemInfo{}, err
-	}
-
-	systemInfoMap := getSystemInfoMap(ctx, log, info, infoKeys, collectors)
-	log.Tracef("system info map: %v", systemInfoMap)
-	s := v1beta1.DeviceSystemInfo{
-		Architecture:         info.Architecture,
-		OperatingSystem:      info.OperatingSystem,
-		BootID:               bootID,
-		AgentVersion:         agentVersion.GitVersion,
-		AdditionalProperties: systemInfoMap,
-	}
-	if len(info.Custom) > 0 {
-		s.CustomInfo = lo.ToPtr(v1beta1.CustomDeviceInfo(info.Custom))
-	}
-	return s, nil
 }
 
 // getBoot returns the boot status from disk.
