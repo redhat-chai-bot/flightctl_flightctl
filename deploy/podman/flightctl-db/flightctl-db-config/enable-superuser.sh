@@ -29,11 +29,50 @@ if [ -n "${POSTGRESQL_MASTER_USER}" ]; then
                   ''CREATE ROLE %I WITH LOGIN PASSWORD %L'',
                   ''${POSTGRESQL_MASTER_USER}'', ''${POSTGRESQL_MASTER_PASSWORD}'');
             END IF;
+        EXCEPTION
+            WHEN duplicate_object THEN
+                RAISE NOTICE ''Role ${POSTGRESQL_MASTER_USER} already exists, skipping'';
         END$$;'
     fi
 
-    # Grant superuser privileges
-    _psql -U postgres -c "ALTER ROLE \"${POSTGRESQL_MASTER_USER}\" WITH SUPERUSER CREATEDB CREATEROLE;"
+    # Grant superuser privileges with idempotency check and retry
+    if _psql -U postgres -tAc \
+        "SELECT 1 FROM pg_roles WHERE rolname = '${POSTGRESQL_MASTER_USER}' AND rolsuper AND rolcreatedb AND rolcreaterole" \
+        | grep -q 1; then
+      echo "${POSTGRESQL_MASTER_USER} already has desired privileges, skipping ALTER ROLE"
+    else
+      _sr_max=5
+      _sr_delay=2
+      _sr_done=false
+      for _sr_attempt in $(seq 1 "$_sr_max"); do
+        if _sr_output=$(_psql -U postgres -c "
+          DO \$body\$
+          BEGIN
+            EXECUTE format('ALTER ROLE %I WITH SUPERUSER CREATEDB CREATEROLE', '${POSTGRESQL_MASTER_USER}');
+          EXCEPTION
+            WHEN unique_violation OR SQLSTATE '40001' THEN
+              RAISE WARNING 'RETRYABLE_CONFLICT: %', SQLERRM;
+          END
+          \$body\$;
+        " 2>&1); then
+          if echo "$_sr_output" | grep -q 'RETRYABLE_CONFLICT'; then
+            echo "Attempt $_sr_attempt/$_sr_max: transient catalog conflict; retrying in ${_sr_delay}s..."
+            sleep "$_sr_delay"
+            continue
+          fi
+          _sr_done=true
+          break
+        fi
+        # psql failed with a non-transient error — fail immediately
+        echo "Fatal SQL error granting superuser privileges on attempt $_sr_attempt:" >&2
+        echo "$_sr_output" >&2
+        exit 1
+      done
+      if [ "$_sr_done" != "true" ]; then
+        echo "Failed to grant superuser privileges after $_sr_max attempts" >&2
+        exit 1
+      fi
+    fi
     echo "Successfully granted superuser privileges to ${POSTGRESQL_MASTER_USER}"
 else
     echo "POSTGRESQL_MASTER_USER not set, skipping superuser configuration"
@@ -64,6 +103,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$DB_APP_USER') THEN
         EXECUTE format('CREATE USER %I WITH PASSWORD %L', '$DB_APP_USER', '$DB_APP_PASSWORD');
     END IF;
+EXCEPTION
+    WHEN duplicate_object THEN
+        RAISE NOTICE 'User $DB_APP_USER already exists, skipping';
 END \$\$;"
 
 # Grant database connection privileges
@@ -82,8 +124,22 @@ _psql -U "$DB_ADMIN_USER" -d "$DB_NAME" -c "GRANT USAGE, SELECT ON ALL SEQUENCES
 
 # Set up automatic privilege granting for new tables
 echo "Setting up automatic privilege granting for new tables..."
-_psql -U "$DB_ADMIN_USER" -d "$DB_NAME" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO \"$DB_APP_USER\";"
-_psql -U "$DB_ADMIN_USER" -d "$DB_NAME" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO \"$DB_APP_USER\";"
+_psql -U "$DB_ADMIN_USER" -d "$DB_NAME" -c "
+DO \$\$
+BEGIN
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO \"$DB_APP_USER\";
+EXCEPTION
+    WHEN unique_violation OR SQLSTATE '40001' THEN
+        RAISE NOTICE 'Transient conflict setting default table privileges, safe to ignore';
+END \$\$;"
+_psql -U "$DB_ADMIN_USER" -d "$DB_NAME" -c "
+DO \$\$
+BEGIN
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO \"$DB_APP_USER\";
+EXCEPTION
+    WHEN unique_violation OR SQLSTATE '40001' THEN
+        RAISE NOTICE 'Transient conflict setting default sequence privileges, safe to ignore';
+END \$\$;"
 
 # Create function to grant permissions on existing tables (for post-migration)
 # Note: This function is also defined in setup_database_users.sql for Helm deployments.
@@ -118,13 +174,19 @@ END;
 \$function\$ LANGUAGE plpgsql;
 EOF
 
-# Drop existing trigger if it exists, then create new one
-_psql -U "$DB_ADMIN_USER" -d "$DB_NAME" -c "DROP EVENT TRIGGER IF EXISTS grant_app_permissions_trigger;"
+# Drop and recreate event trigger atomically
 _psql -U "$DB_ADMIN_USER" -d "$DB_NAME" -c "
-CREATE EVENT TRIGGER grant_app_permissions_trigger
-    ON ddl_command_end
-    WHEN TAG IN ('CREATE TABLE', 'CREATE SEQUENCE')
-    EXECUTE FUNCTION grant_app_permissions();"
+DO \$\$
+BEGIN
+    DROP EVENT TRIGGER IF EXISTS grant_app_permissions_trigger;
+    CREATE EVENT TRIGGER grant_app_permissions_trigger
+        ON ddl_command_end
+        WHEN TAG IN ('CREATE TABLE', 'CREATE SEQUENCE')
+        EXECUTE FUNCTION grant_app_permissions();
+EXCEPTION
+    WHEN duplicate_object THEN
+        RAISE NOTICE 'Event trigger grant_app_permissions_trigger already exists, skipping';
+END \$\$;"
 
 echo "Database user setup completed successfully!"
 echo "Created users:"

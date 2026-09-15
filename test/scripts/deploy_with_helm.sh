@@ -166,7 +166,7 @@ kubectl rollout status deployment flightctl-kv -n flightctl-internal -w --timeou
 
 # Make sure the database is usable from the unit tests
 DB_POD=$(kubectl get pod -n flightctl-internal -l flightctl.service=flightctl-db --no-headers -o custom-columns=":metadata.name" --context kind-kind )
-kubectl exec -n flightctl-internal --context kind-kind "${DB_POD}" -- psql -c 'ALTER ROLE admin WITH SUPERUSER'
+kubectl exec -n flightctl-internal --context kind-kind "${DB_POD}" -- psql -c "SELECT 1 FROM pg_roles WHERE rolname='admin' AND rolsuper" | grep -q 1
 kubectl exec -n flightctl-internal --context kind-kind "${DB_POD}" -- createdb admin 2>/dev/null|| true
 
 

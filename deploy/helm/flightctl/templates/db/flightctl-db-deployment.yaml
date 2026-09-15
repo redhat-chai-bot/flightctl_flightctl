@@ -60,6 +60,21 @@ spec:
           ports:
             - containerPort: 5432
               protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -ec
+                - |
+                  [ "$(cat /proc/1/comm)" = "postgres" ] &&
+                  pg_isready -q \
+                    -h /var/run/postgresql \
+                    -p 5432 \
+                    -U "$POSTGRESQL_MASTER_USER" \
+                    -d "$POSTGRESQL_DATABASE"
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 3
           volumeMounts:
             - mountPath: /var/lib/pgsql/data
               name: flightctl-db

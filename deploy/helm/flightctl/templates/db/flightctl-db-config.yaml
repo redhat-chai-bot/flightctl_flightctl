@@ -9,13 +9,58 @@ metadata:
     flightctl.service: flightctl-db
 data:
   enable-superuser.sh: |
-    #!/bin/bash
+    #!/usr/bin/env bash
+    set -euo pipefail
 
-    _psql () { psql --set ON_ERROR_STOP=1 "$@" ; }
+    __configure_superuser() {
+      local MAX_RETRIES=5
+      local RETRY_DELAY=2
 
-    # Ensure POSTGRESQL_MASTER_USER is treated as a superuser
-    if [ -n "${POSTGRESQL_MASTER_USER}" ]; then
-      echo "Granting superuser privileges to ${POSTGRESQL_MASTER_USER}"
-      _psql -c "ALTER ROLE ${POSTGRESQL_MASTER_USER} WITH SUPERUSER;"
-    fi
+      # Skip if no master user is configured
+      if [ -z "${POSTGRESQL_MASTER_USER:-}" ]; then
+        echo "POSTGRESQL_MASTER_USER not set, skipping superuser configuration"
+        return 0
+      fi
+
+      # Check if user is already a superuser — skip the catalog write entirely
+      if psql --set ON_ERROR_STOP=1 -tAc \
+          "SELECT 1 FROM pg_roles WHERE rolname = '${POSTGRESQL_MASTER_USER}' AND rolsuper" \
+          | grep -q 1; then
+        echo "${POSTGRESQL_MASTER_USER} is already a superuser, nothing to do"
+        return 0
+      fi
+
+      echo "Configuring superuser privileges for ${POSTGRESQL_MASTER_USER}"
+
+      local attempt psql_output
+      for attempt in $(seq 1 "$MAX_RETRIES"); do
+        if psql_output=$(psql --set ON_ERROR_STOP=1 -c "
+          DO \$body\$
+          BEGIN
+            EXECUTE format('ALTER ROLE %I WITH SUPERUSER', '${POSTGRESQL_MASTER_USER}');
+          EXCEPTION
+            WHEN unique_violation OR SQLSTATE '40001' THEN
+              RAISE WARNING 'RETRYABLE_CONFLICT: %', SQLERRM;
+          END
+          \$body\$;
+        " 2>&1); then
+          if echo "$psql_output" | grep -q 'RETRYABLE_CONFLICT'; then
+            echo "Attempt $attempt/$MAX_RETRIES: transient catalog conflict; retrying in ${RETRY_DELAY}s..."
+            sleep "$RETRY_DELAY"
+            continue
+          fi
+          echo "enable-superuser.sh completed successfully"
+          return 0
+        fi
+        # psql failed with a non-transient error — fail immediately
+        echo "enable-superuser.sh: fatal SQL error on attempt $attempt:" >&2
+        echo "$psql_output" >&2
+        return 1
+      done
+
+      echo "enable-superuser.sh failed after $MAX_RETRIES attempts" >&2
+      return 1
+    }
+
+    __configure_superuser
 {{- end }}
