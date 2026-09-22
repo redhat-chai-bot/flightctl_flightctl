@@ -383,6 +383,12 @@ type CatalogItemVersion struct {
 	// Deprecation Deprecation information for a catalog item or version. Presence indicates deprecated status.
 	Deprecation *CatalogItemDeprecation `json:"deprecation,omitempty"`
 
+	// DeviceFeatures Device feature requirements that a device must satisfy to be eligible for this
+	// version. Keys are device feature names and values are the required feature value.
+	// The well-known feature names below are constrained to specific values; additional
+	// string-valued features may be supplied for forward compatibility.
+	DeviceFeatures *map[string]string `json:"deviceFeatures,omitempty"`
+
 	// Readme Detailed documentation, preferably in markdown format.
 	Readme *string `json:"readme,omitempty"`
 

@@ -1324,6 +1324,59 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			wantErr:     true,
 			errContains: "channels[1]",
 		},
+		{
+			name: "valid device features",
+			version: CatalogItemVersion{
+				Version:    "1.0.0",
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
+				Channels:   []string{"stable"},
+				DeviceFeatures: &map[string]string{
+					"gpu.present": "true",
+					"kvm.enabled": "false",
+					"os.mode":     "image",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "unknown device feature name",
+			version: CatalogItemVersion{
+				Version:    "1.0.0",
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
+				Channels:   []string{"stable"},
+				DeviceFeatures: &map[string]string{
+					"cpu.arch": "arm64",
+				},
+			},
+			wantErr:     true,
+			errContains: "unknown device feature",
+		},
+		{
+			name: "invalid boolean device feature value",
+			version: CatalogItemVersion{
+				Version:    "1.0.0",
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
+				Channels:   []string{"stable"},
+				DeviceFeatures: &map[string]string{
+					"gpu.present": "yes",
+				},
+			},
+			wantErr:     true,
+			errContains: "invalid value",
+		},
+		{
+			name: "invalid os.mode device feature value",
+			version: CatalogItemVersion{
+				Version:    "1.0.0",
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
+				Channels:   []string{"stable"},
+				DeviceFeatures: &map[string]string{
+					"os.mode": "container",
+				},
+			},
+			wantErr:     true,
+			errContains: "invalid value",
+		},
 	}
 
 	for _, tt := range tests {

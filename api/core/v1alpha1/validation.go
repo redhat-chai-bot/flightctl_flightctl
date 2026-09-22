@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -260,7 +261,41 @@ func validateCatalogItemVersion(version CatalogItemVersion, index int, seenVersi
 		allErrs = append(allErrs, validateCatalogItemDeprecation(version.Deprecation, pathPrefix+".deprecation")...)
 	}
 
+	if version.DeviceFeatures != nil {
+		allErrs = append(allErrs, validateDeviceFeatures(*version.DeviceFeatures, pathPrefix+".deviceFeatures")...)
+	}
+
 	return allErrs
+}
+
+// validateDeviceFeatures ensures every key is a known device feature name and
+// every value is valid for that feature.
+func validateDeviceFeatures(features map[string]string, pathPrefix string) []error {
+	allErrs := []error{}
+
+	for name, value := range features {
+		validValues, ok := ValidDeviceFeatureValues[DeviceFeatureName(name)]
+		if !ok {
+			allErrs = append(allErrs, fmt.Errorf("%s[%s]: unknown device feature; must be one of: %s", pathPrefix, name, validDeviceFeatureNames()))
+			continue
+		}
+		if !slices.Contains(validValues, value) {
+			allErrs = append(allErrs, fmt.Errorf("%s[%s]: invalid value %q; must be one of: %s", pathPrefix, name, value, strings.Join(validValues, ", ")))
+		}
+	}
+
+	return allErrs
+}
+
+// validDeviceFeatureNames returns a comma-separated, stable list of valid
+// device feature names.
+func validDeviceFeatureNames() string {
+	names := []string{
+		string(DeviceFeatureGPUPresent),
+		string(DeviceFeatureKVMEnabled),
+		string(DeviceFeatureOSMode),
+	}
+	return strings.Join(names, ", ")
 }
 
 func validateReplacesGraph(versions []CatalogItemVersion) []error {

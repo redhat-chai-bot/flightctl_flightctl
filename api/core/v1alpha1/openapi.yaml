@@ -2030,6 +2030,38 @@ components:
               example: ">=1.0.0 <1.3.0"
             deprecation:
               $ref: '#/components/schemas/CatalogItemDeprecation'
+            deviceFeatures:
+              type: object
+              x-go-type: 'map[string]string'
+              description: |
+                Device feature requirements that a device must satisfy to be eligible for this
+                version. Keys are device feature names and values are the required feature value.
+                The well-known feature names below are constrained to specific values; additional
+                string-valued features may be supplied for forward compatibility.
+              properties:
+                gpu.present:
+                  type: string
+                  enum:
+                    - "true"
+                    - "false"
+                  description: 'Whether a GPU is present and available on the device.'
+                kvm.enabled:
+                  type: string
+                  enum:
+                    - "true"
+                    - "false"
+                  description: 'Whether KVM kernel modules are loaded and /dev/kvm is present.'
+                os.mode:
+                  type: string
+                  enum:
+                    - image
+                    - package
+                  description: 'OS management mode: bootc image mode ("image") or traditional package mode ("package").'
+              additionalProperties:
+                type: string
+              example:
+                gpu.present: "true"
+                os.mode: "image"
           required:
             - version
             - channels
