@@ -47,7 +47,7 @@ func TestManager(t *testing.T) {
 	mockExecuter.EXPECT().ExecuteWithContext(gomock.Any(), "uptime", "-s").Return(bootTime, "", 0).Times(4)
 
 	// initialize client new device
-	manager := NewManager(log, mockExecuter, readWriter, dataDir, nil, nil, collectTimeout, 0)
+	manager := NewManager(log, mockExecuter, readWriter, dataDir, nil, nil, collectTimeout, 0, "")
 	err = manager.Initialize(context.Background())
 	require.NoError(err)
 	require.NotNil(manager)
@@ -68,7 +68,7 @@ func TestManager(t *testing.T) {
 	require.NoError(err)
 
 	// reinitialize client
-	manager = NewManager(log, mockExecuter, readWriter, dataDir, nil, nil, collectTimeout, 0)
+	manager = NewManager(log, mockExecuter, readWriter, dataDir, nil, nil, collectTimeout, 0, "")
 	err = manager.Initialize(context.Background())
 	require.NoError(err)
 	require.NotEmpty(manager.BootTime())
@@ -106,7 +106,7 @@ func TestRun(t *testing.T) {
 		log := log.NewPrefixLogger("test")
 
 		// No periodic interval — Run should return without recollecting.
-		manager := NewManager(log, mockExecuter, readWriter, dataDir, []string{common.TPMVendorInfoKey}, nil, collectTimeout, 0)
+		manager := NewManager(log, mockExecuter, readWriter, dataDir, []string{common.TPMVendorInfoKey}, nil, collectTimeout, 0, "")
 		manager.RegisterCollector(context.Background(), common.TPMVendorInfoKey, func(context.Context) string {
 			return "TPM vendor"
 		})
@@ -165,7 +165,7 @@ func TestRun(t *testing.T) {
 		log := log.NewPrefixLogger("test")
 
 		collectionInterval := util.Duration(500 * time.Millisecond)
-		manager := NewManager(log, mockExecuter, readWriter, dataDir, nil, nil, collectTimeout, collectionInterval)
+		manager := NewManager(log, mockExecuter, readWriter, dataDir, nil, nil, collectTimeout, collectionInterval, "")
 		err = manager.Initialize(context.Background())
 		require.NoError(err)
 		// Ignore the boot-time and initial collection calls.
@@ -250,7 +250,7 @@ func TestRun(t *testing.T) {
 		log := log.NewPrefixLogger("test")
 
 		collectionInterval := util.Duration(time.Millisecond)
-		manager := NewManager(log, mockExecuter, readWriter, dataDir, nil, nil, collectTimeout, collectionInterval)
+		manager := NewManager(log, mockExecuter, readWriter, dataDir, nil, nil, collectTimeout, collectionInterval, "")
 		err = manager.Initialize(context.Background())
 		require.NoError(err)
 		// Ignore the boot-time and initial collection calls.
@@ -312,7 +312,7 @@ func TestStatusReturnsCachedResults(t *testing.T) {
 
 		log := log.NewPrefixLogger("test")
 
-		manager := NewManager(log, mockExecuter, readWriter, dataDir, nil, nil, collectTimeout, 0)
+		manager := NewManager(log, mockExecuter, readWriter, dataDir, nil, nil, collectTimeout, 0, "")
 		err = manager.Initialize(context.Background())
 		require.NoError(err)
 
@@ -353,6 +353,7 @@ func TestRefreshRuntimeCollectors(t *testing.T) {
 		nil,
 		util.Duration(5*time.Second),
 		0,
+		"",
 	)
 	manager.RegisterCollector(context.Background(), common.TPMVendorInfoKey, func(context.Context) string {
 		return "TPM vendor"
@@ -446,7 +447,7 @@ func TestReloadConfig(t *testing.T) {
 			log := log.NewPrefixLogger("test")
 			collectTimeout := util.Duration(5 * time.Second)
 
-			manager := NewManager(log, mockExecuter, readWriter, dataDir, tt.initialKeys, nil, collectTimeout, 0)
+			manager := NewManager(log, mockExecuter, readWriter, dataDir, tt.initialKeys, nil, collectTimeout, 0, "")
 
 			cfg := &config.Config{
 				SystemInfo: tt.newKeys,

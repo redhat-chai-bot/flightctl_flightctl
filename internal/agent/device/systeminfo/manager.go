@@ -45,6 +45,10 @@ type manager struct {
 	collectors         map[string]CollectorFn
 	cachedSystemInfo   *v1beta1.DeviceSystemInfo
 
+	// osMode is the OS management mode reported by OS capabilities. It is
+	// duplicated onto DeviceSystemInfo for convenience.
+	osMode v1beta1.OsModeType
+
 	log *log.PrefixLogger
 }
 
@@ -57,6 +61,7 @@ func NewManager(
 	customKeys []string,
 	collectionTimeout util.Duration,
 	collectionInterval util.Duration,
+	osMode v1beta1.OsModeType,
 ) *manager {
 	return &manager{
 		exec:               exec,
@@ -68,6 +73,7 @@ func NewManager(
 		collectionInterval: time.Duration(collectionInterval),
 		intervalChanged:    make(chan struct{}, 1),
 		collectors:         make(map[string]CollectorFn),
+		osMode:             osMode,
 		log:                log,
 	}
 }
@@ -211,6 +217,7 @@ func (m *manager) collect(ctx context.Context) {
 	bootID := m.bootID
 	collectors := maps.Clone(m.collectors)
 	dataDir := m.dataDir
+	osMode := m.osMode
 	m.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -226,6 +233,7 @@ func (m *manager) collect(ctx context.Context) {
 		bootID,
 		collectors,
 		filepath.Join(dataDir, HardwareMapFileName),
+		osMode,
 	)
 
 	m.mu.Lock()
@@ -303,13 +311,17 @@ func (m *manager) RefreshRuntimeCollectors(ctx context.Context) {
 
 // defaultSystemInfo returns the default system info.
 func (m *manager) defaultSystemInfo() v1beta1.DeviceSystemInfo {
-	return v1beta1.DeviceSystemInfo{
+	info := v1beta1.DeviceSystemInfo{
 		BootID:               m.bootID,
 		AgentVersion:         version.Get().String(),
 		OperatingSystem:      runtime.GOOS,
 		Architecture:         runtime.GOARCH,
 		AdditionalProperties: make(map[string]string),
 	}
+	if m.osMode != "" {
+		info.OsMode = lo.ToPtr(m.osMode)
+	}
+	return info
 }
 
 // RegisterCollector allows the caller to register a collector function for system information.
@@ -366,6 +378,7 @@ func collectDeviceSystemInfo(
 	bootID string,
 	collectors map[string]CollectorFn,
 	hardwareMapPath string,
+	osMode v1beta1.OsModeType,
 ) (v1beta1.DeviceSystemInfo, error) {
 	agentVersion := version.Get()
 
@@ -390,10 +403,56 @@ func collectDeviceSystemInfo(
 		AgentVersion:         agentVersion.GitVersion,
 		AdditionalProperties: systemInfoMap,
 	}
+	if gpus := gpuInfoToAPI(info.Hardware.GPU); len(gpus) > 0 {
+		s.Gpus = &gpus
+	}
+	s.KvmEnabled = lo.ToPtr(info.Hardware.KVM.Enabled)
+	if osMode != "" {
+		s.OsMode = lo.ToPtr(osMode)
+	}
 	if len(info.Custom) > 0 {
 		s.CustomInfo = lo.ToPtr(v1beta1.CustomDeviceInfo(info.Custom))
 	}
 	return s, nil
+}
+
+// gpuInfoToAPI converts internal GPU device information into the API
+// representation used in DeviceSystemInfo.
+func gpuInfoToAPI(gpus []GPUDeviceInfo) []v1beta1.GPUInfo {
+	if len(gpus) == 0 {
+		return nil
+	}
+	result := make([]v1beta1.GPUInfo, 0, len(gpus))
+	for _, gpu := range gpus {
+		g := v1beta1.GPUInfo{
+			Index:  gpu.Index,
+			Vendor: gpu.Vendor,
+			Model:  gpu.Model,
+		}
+		if gpu.DeviceID != "" {
+			g.DeviceId = lo.ToPtr(gpu.DeviceID)
+		}
+		if gpu.PCIAddress != "" {
+			g.PciAddress = lo.ToPtr(gpu.PCIAddress)
+		}
+		if gpu.RevisionID != "" {
+			g.RevisionId = lo.ToPtr(gpu.RevisionID)
+		}
+		if gpu.VendorID != "" {
+			g.VendorId = lo.ToPtr(gpu.VendorID)
+		}
+		if gpu.MemoryBytes > 0 {
+			g.MemoryBytes = lo.ToPtr(int64(gpu.MemoryBytes))
+		}
+		if gpu.Arch != "" {
+			g.Architecture = lo.ToPtr(gpu.Arch)
+		}
+		if len(gpu.Features) > 0 {
+			g.Features = lo.ToPtr(slices.Clone(gpu.Features))
+		}
+		result = append(result, g)
+	}
+	return result
 }
 
 // getBoot returns the boot status from disk.

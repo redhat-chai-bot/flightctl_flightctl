@@ -217,6 +217,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.config.SystemInfoCustom,
 		a.config.SystemInfoTimeout,
 		a.config.SystemInfoCollectionInterval(),
+		caps.OsMode,
 	)
 
 	if tpmClient != nil {

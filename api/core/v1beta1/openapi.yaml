@@ -6812,6 +6812,46 @@ components:
           type: string
           description: The last time the device was seen by the service.
           format: date-time
+    GPUInfo:
+      type: object
+      required:
+        - index
+        - vendor
+        - model
+      properties:
+        index:
+          type: integer
+          description: Zero-based index of the GPU device.
+        vendor:
+          type: string
+          description: GPU vendor name (e.g. NVIDIA, AMD, Intel).
+        model:
+          type: string
+          description: GPU model name.
+        deviceId:
+          type: string
+          description: PCI device ID.
+        pciAddress:
+          type: string
+          description: PCI bus address (e.g. 0000:01:00.0).
+        revisionId:
+          type: string
+          description: PCI revision ID.
+        vendorId:
+          type: string
+          description: PCI vendor ID.
+        memoryBytes:
+          type: integer
+          format: int64
+          description: GPU memory size in bytes.
+        architecture:
+          type: string
+          description: GPU architecture.
+        features:
+          type: array
+          items:
+            type: string
+          description: GPU feature flags.
     DeviceSystemInfo:
       required:
         - architecture
@@ -6851,6 +6891,17 @@ components:
             agent does not report the field.
         customInfo:
           $ref: "#/components/schemas/CustomDeviceInfo"
+        gpus:
+          type: array
+          items:
+            $ref: '#/components/schemas/GPUInfo'
+          description: List of GPU devices discovered on the system.
+        kvmEnabled:
+          type: boolean
+          description: >-
+            Whether KVM virtualization is active and available on the system.
+        osMode:
+          $ref: '#/components/schemas/OsModeType'
       additionalProperties:
         type: string
         description: |

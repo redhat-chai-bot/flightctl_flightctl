@@ -84,6 +84,7 @@ type HardwareFacts struct {
 	GPU     []GPUDeviceInfo `json:"gpu,omitempty"`
 	BIOS    *BIOSInfo       `json:"bios,omitempty"`
 	System  *SystemInfo     `json:"system,omitempty"`
+	KVM     KVMInfo         `json:"kvm"`
 }
 
 // CPUInfo represents CPU information
@@ -230,6 +231,12 @@ type SystemInfo struct {
 	SKU          string `json:"sku,omitempty"`
 }
 
+// KVMInfo represents KVM hardware virtualization availability.
+type KVMInfo struct {
+	// Enabled reports whether KVM virtualization is active and available.
+	Enabled bool `json:"enabled"`
+}
+
 type infoMap map[string]string
 
 type Boot struct {
@@ -264,6 +271,7 @@ const (
 	collectorKernel
 	collectorDistribution
 	collectorBoot
+	collectorKVM
 )
 
 type collectCfg struct {
@@ -303,6 +311,11 @@ func collectGPUFunc(ctx context.Context, collectCtx *collectContext, info *Info)
 		return fmt.Errorf("GPU collector failed: %w", err)
 	}
 	info.Hardware.GPU = gpuInfo
+	return nil
+}
+
+func collectKVMFunc(ctx context.Context, collectCtx *collectContext, info *Info) error {
+	info.Hardware.KVM = collectKVMInfo(collectCtx.log, collectCtx.reader)
 	return nil
 }
 
@@ -483,6 +496,9 @@ func Collect(ctx context.Context, log *log.PrefixLogger, exec executer.Executer,
 
 	// always collect boot info (needed for reboot detection)
 	cfg.addCollector(collectorBoot, collectBootFunc)
+
+	// always collect KVM availability; it is not tied to a system-info key
+	cfg.addCollector(collectorKVM, collectKVMFunc)
 
 	// collector version
 	info.Metadata = map[string]interface{}{
