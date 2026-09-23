@@ -6852,6 +6852,70 @@ components:
             agent does not report the field.
         customInfo:
           $ref: "#/components/schemas/CustomDeviceInfo"
+        gpus:
+          type: array
+          description: List of GPU devices discovered on the device.
+          items:
+            type: object
+            description: Information about a GPU device discovered on the device.
+            properties:
+              index:
+                type: integer
+                description: The index of the GPU device on the system.
+              vendor:
+                type: string
+                description: The GPU vendor name.
+              model:
+                type: string
+                description: The GPU model name.
+              deviceId:
+                type: string
+                description: The PCI device ID of the GPU.
+              pciAddress:
+                type: string
+                description: The PCI bus address of the GPU.
+              revisionId:
+                type: string
+                description: The PCI revision ID of the GPU.
+              vendorId:
+                type: string
+                description: The PCI vendor ID of the GPU.
+              memoryBytes:
+                type: integer
+                format: int64
+                description: The amount of GPU memory in bytes.
+              arch:
+                type: string
+                description: The GPU architecture.
+              features:
+                type: array
+                description: The list of supported GPU features.
+                items:
+                  type: string
+        kvm:
+          type: object
+          description: KVM virtualization information reported by the device.
+          properties:
+            enabled:
+              type: boolean
+              description: >-
+                Whether KVM virtualization is active and available on the
+                device.
+        osMode:
+          type: string
+          description: >-
+            OS management mode reported via systemInfo. "image" indicates the
+            OS is managed via bootc or rpm-ostree image updates. "package"
+            indicates no image-based OS management is available. "unknown"
+            indicates the OS management mode could not be determined.
+          enum:
+            - image
+            - package
+            - unknown
+          x-enum-varnames:
+            - DeviceSystemInfoOsModeImage
+            - DeviceSystemInfoOsModePackage
+            - DeviceSystemInfoOsModeUnknown
       additionalProperties:
         type: string
         description: |

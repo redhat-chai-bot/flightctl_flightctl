@@ -245,6 +245,13 @@ const (
 	DeviceSummaryStatusUnknown           DeviceSummaryStatusType = "Unknown"
 )
 
+// Defines values for DeviceSystemInfoOsMode.
+const (
+	DeviceSystemInfoOsModeImage   DeviceSystemInfoOsMode = "image"
+	DeviceSystemInfoOsModePackage DeviceSystemInfoOsMode = "package"
+	DeviceSystemInfoOsModeUnknown DeviceSystemInfoOsMode = "unknown"
+)
+
 // Defines values for DeviceUpdatedStatusType.
 const (
 	DeviceUpdatedStatusOutOfDate DeviceUpdatedStatusType = "OutOfDate"
@@ -1723,13 +1730,58 @@ type DeviceSystemInfo struct {
 	// DeltaEligible Whether this device can consume OCI deltas. True when the oci-delta binary is present. False when it is not. Omitted when an older agent does not report the field.
 	DeltaEligible *bool `json:"deltaEligible,omitempty"`
 
+	// Gpus List of GPU devices discovered on the device.
+	Gpus *[]struct {
+		// Arch The GPU architecture.
+		Arch *string `json:"arch,omitempty"`
+
+		// DeviceId The PCI device ID of the GPU.
+		DeviceId *string `json:"deviceId,omitempty"`
+
+		// Features The list of supported GPU features.
+		Features *[]string `json:"features,omitempty"`
+
+		// Index The index of the GPU device on the system.
+		Index *int `json:"index,omitempty"`
+
+		// MemoryBytes The amount of GPU memory in bytes.
+		MemoryBytes *int64 `json:"memoryBytes,omitempty"`
+
+		// Model The GPU model name.
+		Model *string `json:"model,omitempty"`
+
+		// PciAddress The PCI bus address of the GPU.
+		PciAddress *string `json:"pciAddress,omitempty"`
+
+		// RevisionId The PCI revision ID of the GPU.
+		RevisionId *string `json:"revisionId,omitempty"`
+
+		// Vendor The GPU vendor name.
+		Vendor *string `json:"vendor,omitempty"`
+
+		// VendorId The PCI vendor ID of the GPU.
+		VendorId *string `json:"vendorId,omitempty"`
+	} `json:"gpus,omitempty"`
+
+	// Kvm KVM virtualization information reported by the device.
+	Kvm *struct {
+		// Enabled Whether KVM virtualization is active and available on the device.
+		Enabled *bool `json:"enabled,omitempty"`
+	} `json:"kvm,omitempty"`
+
 	// OciDeltaVersion Version reported by `oci-delta --version`. Absent when oci-delta is not installed or the version command fails.
 	OciDeltaVersion *string `json:"ociDeltaVersion,omitempty"`
 
 	// OperatingSystem The Operating System reported by the device.
-	OperatingSystem      string            `json:"operatingSystem"`
-	AdditionalProperties map[string]string `json:"-"`
+	OperatingSystem string `json:"operatingSystem"`
+
+	// OsMode OS management mode reported via systemInfo. "image" indicates the OS is managed via bootc or rpm-ostree image updates. "package" indicates no image-based OS management is available. "unknown" indicates the OS management mode could not be determined.
+	OsMode               *DeviceSystemInfoOsMode `json:"osMode,omitempty"`
+	AdditionalProperties map[string]string       `json:"-"`
 }
+
+// DeviceSystemInfoOsMode OS management mode reported via systemInfo. "image" indicates the OS is managed via bootc or rpm-ostree image updates. "package" indicates no image-based OS management is available. "unknown" indicates the OS management mode could not be determined.
+type DeviceSystemInfoOsMode string
 
 // DeviceUpdatePolicySpec Specifies the policy for managing device updates, including when updates should be downloaded and applied.
 type DeviceUpdatePolicySpec struct {
@@ -4078,6 +4130,22 @@ func (a *DeviceSystemInfo) UnmarshalJSON(b []byte) error {
 		delete(object, "deltaEligible")
 	}
 
+	if raw, found := object["gpus"]; found {
+		err = json.Unmarshal(raw, &a.Gpus)
+		if err != nil {
+			return fmt.Errorf("error reading 'gpus': %w", err)
+		}
+		delete(object, "gpus")
+	}
+
+	if raw, found := object["kvm"]; found {
+		err = json.Unmarshal(raw, &a.Kvm)
+		if err != nil {
+			return fmt.Errorf("error reading 'kvm': %w", err)
+		}
+		delete(object, "kvm")
+	}
+
 	if raw, found := object["ociDeltaVersion"]; found {
 		err = json.Unmarshal(raw, &a.OciDeltaVersion)
 		if err != nil {
@@ -4092,6 +4160,14 @@ func (a *DeviceSystemInfo) UnmarshalJSON(b []byte) error {
 			return fmt.Errorf("error reading 'operatingSystem': %w", err)
 		}
 		delete(object, "operatingSystem")
+	}
+
+	if raw, found := object["osMode"]; found {
+		err = json.Unmarshal(raw, &a.OsMode)
+		if err != nil {
+			return fmt.Errorf("error reading 'osMode': %w", err)
+		}
+		delete(object, "osMode")
 	}
 
 	if len(object) != 0 {
@@ -4149,6 +4225,20 @@ func (a DeviceSystemInfo) MarshalJSON() ([]byte, error) {
 		}
 	}
 
+	if a.Gpus != nil {
+		object["gpus"], err = json.Marshal(a.Gpus)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'gpus': %w", err)
+		}
+	}
+
+	if a.Kvm != nil {
+		object["kvm"], err = json.Marshal(a.Kvm)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'kvm': %w", err)
+		}
+	}
+
 	if a.OciDeltaVersion != nil {
 		object["ociDeltaVersion"], err = json.Marshal(a.OciDeltaVersion)
 		if err != nil {
@@ -4159,6 +4249,13 @@ func (a DeviceSystemInfo) MarshalJSON() ([]byte, error) {
 	object["operatingSystem"], err = json.Marshal(a.OperatingSystem)
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling 'operatingSystem': %w", err)
+	}
+
+	if a.OsMode != nil {
+		object["osMode"], err = json.Marshal(a.OsMode)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'osMode': %w", err)
+		}
 	}
 
 	for fieldName, field := range a.AdditionalProperties {
