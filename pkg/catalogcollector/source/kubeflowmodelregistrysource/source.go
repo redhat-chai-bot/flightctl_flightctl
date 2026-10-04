@@ -27,28 +27,39 @@ type source struct {
 	poller            *pollsource.Helper
 	next              catalogcollector.Consumer
 	log               *logrus.Entry
-	metrics           *sourceMetrics
+
+	// Retain the metrics instance for the source lifetime. The poller callbacks
+	// also reference it, but keeping it here makes the ownership explicit.
+	metrics *sourceMetrics
 }
 
 var _ catalogcollector.Source = (*source)(nil)
 
-// Run blocks until ctx is cancelled. It drives the poll loop via the pollsource
-// helper, performing a complete collection on each tick.
+// Run blocks until the context is cancelled or the polling helper encounters a
+// fatal configuration error.
 func (s *source) Run(ctx context.Context) error {
-	s.log.Info("source starting")
+	s.log.Info("source started")
+	defer s.log.Info("source stopped")
+
 	return s.poller.Run(ctx, s.collect, s.next)
 }
 
 // collect performs one complete collection cycle:
-//  1. Fetch all pages of LIVE registered models.
-//  2. For each model, fetch all pages of LIVE model versions.
-//  3. For each version, fetch all pages of model-artifact typed artifacts and
-//     select exactly one eligible artifact.
-//  4. Normalize and validate the whole set, then build a CatalogSnapshot.
 //
-// Any error aborts the complete cycle. A partial snapshot is never emitted.
-func (s *source) collect(ctx context.Context) (*catalogcollector.CatalogSnapshot, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.collectionTimeout)
+//  1. Fetch every page of LIVE RegisteredModels.
+//  2. Fetch every page of LIVE ModelVersions for each model.
+//  3. Fetch every page of model-artifact resources for each version.
+//  4. Select exactly one eligible immutable artifact per LIVE version.
+//  5. Normalize the complete result and produce a deterministic revision.
+//
+// Any error aborts the cycle. No partial snapshot is returned or delivered.
+func (s *source) collect(
+	parentCtx context.Context,
+) (*catalogcollector.CatalogSnapshot, error) {
+	ctx, cancel := context.WithTimeout(
+		parentCtx,
+		s.collectionTimeout,
+	)
 	defer cancel()
 
 	models, err := s.fetchAllModels(ctx)
@@ -57,32 +68,48 @@ func (s *source) collect(ctx context.Context) (*catalogcollector.CatalogSnapshot
 	}
 
 	collected := make([]collectedModel, 0, len(models))
-	skipped := 0
+	skippedModels := 0
+
 	for _, model := range models {
-		if model.Id == nil {
-			return nil, fmt.Errorf("registered model name=%q has nil id (unexpected server response)", model.Name)
+		if model.Id == nil || *model.Id == "" {
+			return nil, fmt.Errorf(
+				"registered model name=%q has no id in the Model Registry response",
+				model.Name,
+			)
 		}
-		cm, err := s.fetchModel(ctx, model)
+
+		collectedModel, err := s.fetchModel(ctx, model)
 		if err != nil {
 			return nil, err
 		}
-		if cm == nil {
-			skipped++
+		if collectedModel == nil {
+			skippedModels++
 			continue
 		}
-		collected = append(collected, *cm)
+
+		collected = append(collected, *collectedModel)
 	}
 
 	catalogs, items, err := toSnapshot(s.catalog, collected)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf(
+			"mapping Model Registry snapshot: %w",
+			err,
+		)
 	}
 
-	revision := computeRevision(catalogs, items)
+	revision, err := computeRevision(catalogs, items)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"computing snapshot revision: %w",
+			err,
+		)
+	}
+
 	s.log.WithFields(logrus.Fields{
-		"eligible": len(items),
-		"skipped":  skipped,
-		"revision": revision,
+		"eligible_model_count": len(items),
+		"skipped_model_count":  skippedModels,
+		"revision":             revision,
 	}).Debug("collection complete")
 
 	return &catalogcollector.CatalogSnapshot{
@@ -92,237 +119,414 @@ func (s *source) collect(ctx context.Context) (*catalogcollector.CatalogSnapshot
 	}, nil
 }
 
-// fetchAllModels paginates GET /registered_models?filterQuery=state='LIVE'.
-func (s *source) fetchAllModels(ctx context.Context) ([]mrapi.RegisteredModel, error) {
-	var all []mrapi.RegisteredModel
-	token := ""
-	seen := map[string]bool{"": true}
+// fetchAllModels retrieves every page of LIVE RegisteredModels.
+func (s *source) fetchAllModels(
+	ctx context.Context,
+) ([]mrapi.RegisteredModel, error) {
+	models := make([]mrapi.RegisteredModel, 0)
+	nextPageToken := ""
+	seenTokens := make(map[string]struct{})
 
 	for {
-		list, err := s.client.ListRegisteredModels(ctx, token)
+		list, err := s.client.ListRegisteredModels(
+			ctx,
+			nextPageToken,
+		)
 		if err != nil {
-			return nil, s.wrapHTTPError("listing registered models", err)
+			return nil, s.wrapHTTPError(
+				"listing registered models",
+				err,
+			)
 		}
-		all = append(all, list.Items...)
+		if list == nil {
+			return nil, fmt.Errorf(
+				"listing registered models returned no response",
+			)
+		}
+
+		models = append(models, list.Items...)
 
 		next := list.NextPageToken
 		if next == "" {
-			break
+			return models, nil
 		}
-		if seen[next] {
-			return nil, fmt.Errorf("pagination loop: server returned repeated nextPageToken %q when listing registered models", next)
+		if _, found := seenTokens[next]; found {
+			return nil, fmt.Errorf(
+				"pagination loop while listing registered models: " +
+					"the server repeated a nextPageToken",
+			)
 		}
-		seen[next] = true
-		token = next
+
+		seenTokens[next] = struct{}{}
+		nextPageToken = next
 	}
-	return all, nil
 }
 
-// fetchModel fetches all LIVE versions and their eligible artifacts for one
-// registered model. Returns nil (no error) if the model has no eligible
-// versions — such models are silently excluded from the snapshot.
-func (s *source) fetchModel(ctx context.Context, model mrapi.RegisteredModel) (*collectedModel, error) {
+// fetchModel retrieves every LIVE version and its eligible artifact for one
+// RegisteredModel.
+//
+// A model with no LIVE versions is omitted from the snapshot. Because versions
+// are filtered server-side, this covers both models with no versions and
+// models whose versions are all archived.
+func (s *source) fetchModel(
+	ctx context.Context,
+	model mrapi.RegisteredModel,
+) (*collectedModel, error) {
 	modelID := safeID(model.Id)
 
 	versions, err := s.fetchAllVersions(ctx, modelID)
 	if err != nil {
 		return nil, err
 	}
-
-	var eligible []collectedVersion
-	for _, ver := range versions {
-		if ver.Id == nil {
-			return nil, fmt.Errorf("registered model id=%s name=%q: version name=%q has nil id", modelID, model.Name, ver.Name)
-		}
-		cv, err := s.fetchVersion(ctx, modelID, model.Name, ver)
-		if err != nil {
-			return nil, err
-		}
-		if cv == nil {
-			continue
-		}
-		eligible = append(eligible, *cv)
-	}
-
-	if len(eligible) == 0 {
-		// Model has no LIVE versions (either no versions at all, or all archived
-		// by the server-side filter). Silently omit it from the snapshot; the
-		// caller accumulates the skipped count and logs a single summary.
+	if len(versions) == 0 {
 		return nil, nil
 	}
 
-	return &collectedModel{model: model, versions: eligible}, nil
+	collectedVersions := make(
+		[]collectedVersion,
+		0,
+		len(versions),
+	)
+
+	for _, version := range versions {
+		if version.Id == nil || *version.Id == "" {
+			return nil, fmt.Errorf(
+				"registered model id=%s name=%q: "+
+					"model version name=%q has no id in the "+
+					"Model Registry response",
+				modelID,
+				model.Name,
+				version.Name,
+			)
+		}
+
+		collectedVersion, err := s.fetchVersion(
+			ctx,
+			modelID,
+			model.Name,
+			version,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		collectedVersions = append(
+			collectedVersions,
+			*collectedVersion,
+		)
+	}
+
+	return &collectedModel{
+		model:    model,
+		versions: collectedVersions,
+	}, nil
 }
 
-// fetchAllVersions paginates GET /registered_models/{id}/versions?filterQuery=state='LIVE'.
-func (s *source) fetchAllVersions(ctx context.Context, modelID string) ([]mrapi.ModelVersion, error) {
-	var all []mrapi.ModelVersion
-	token := ""
-	seen := map[string]bool{"": true}
+// fetchAllVersions retrieves every page of LIVE ModelVersions belonging to one
+// RegisteredModel.
+func (s *source) fetchAllVersions(
+	ctx context.Context,
+	modelID string,
+) ([]mrapi.ModelVersion, error) {
+	versions := make([]mrapi.ModelVersion, 0)
+	nextPageToken := ""
+	seenTokens := make(map[string]struct{})
 
 	for {
-		list, err := s.client.ListModelVersions(ctx, modelID, token)
+		list, err := s.client.ListModelVersions(
+			ctx,
+			modelID,
+			nextPageToken,
+		)
 		if err != nil {
-			return nil, s.wrapHTTPError(fmt.Sprintf("listing versions for model id=%s", modelID), err)
+			return nil, s.wrapHTTPError(
+				fmt.Sprintf(
+					"listing versions for registered model id=%s",
+					modelID,
+				),
+				err,
+			)
 		}
-		all = append(all, list.Items...)
+		if list == nil {
+			return nil, fmt.Errorf(
+				"listing versions for registered model id=%s "+
+					"returned no response",
+				modelID,
+			)
+		}
+
+		versions = append(versions, list.Items...)
 
 		next := list.NextPageToken
 		if next == "" {
-			break
+			return versions, nil
 		}
-		if seen[next] {
-			return nil, fmt.Errorf("pagination loop: server returned repeated nextPageToken %q when listing versions for model id=%s", next, modelID)
+		if _, found := seenTokens[next]; found {
+			return nil, fmt.Errorf(
+				"pagination loop while listing versions for "+
+					"registered model id=%s: the server repeated "+
+					"a nextPageToken",
+				modelID,
+			)
 		}
-		seen[next] = true
-		token = next
+
+		seenTokens[next] = struct{}{}
+		nextPageToken = next
 	}
-	return all, nil
 }
 
-// fetchVersion fetches and validates artifacts for a single model version.
-// Returns nil (no error) when the version has no eligible artifacts but still
-// has an active state — the cycle fails hard when it has an ineligible artifact
-// or ambiguous selection.
-func (s *source) fetchVersion(ctx context.Context, modelID, modelName string, ver mrapi.ModelVersion) (*collectedVersion, error) {
-	versionID := safeID(ver.Id)
+// fetchVersion retrieves and validates artifacts for one LIVE ModelVersion.
+//
+// Exactly one artifact must satisfy all eligibility requirements. No eligible
+// artifact makes the version undeployable, while multiple eligible artifacts
+// make the mapping ambiguous; both conditions fail the complete cycle.
+func (s *source) fetchVersion(
+	ctx context.Context,
+	modelID string,
+	modelName string,
+	version mrapi.ModelVersion,
+) (*collectedVersion, error) {
+	versionID := safeID(version.Id)
+
 	artifacts, err := s.fetchAllArtifacts(ctx, versionID)
 	if err != nil {
 		return nil, err
 	}
 
-	type eligible struct {
-		repo   string
-		digest string
+	type artifactCandidate struct {
+		repository string
+		digest     string
 	}
-	var eligible_ []eligible
+
+	candidates := make([]artifactCandidate, 0, 1)
 
 	for i := range artifacts {
-		art := artifacts[i]
-		ma, ok := extractModelArtifact(art)
+		modelArtifact, ok := extractModelArtifact(artifacts[i])
 		if !ok {
 			continue
 		}
-		repo, digest, isElig, err := isEligibleArtifact(ma)
+
+		repository, digest, eligible, err := isEligibleArtifact(
+			modelArtifact,
+		)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"registered model id=%s name=%q, version id=%s name=%q: %w",
-				modelID, modelName, versionID, ver.Name, err)
+				"registered model id=%s name=%q, "+
+					"version id=%s name=%q: %w",
+				modelID,
+				modelName,
+				versionID,
+				version.Name,
+				err,
+			)
 		}
-		if isElig {
-			eligible_ = append(eligible_, eligible{repo, digest})
-		} else {
-			if ma.State != nil {
-				s.log.WithFields(logrus.Fields{
-					"model_id":       modelID,
-					"version_id":     versionID,
-					"artifact_state": string(*ma.State),
-				}).Debug("artifact excluded by state filter (Open Question 9.4)")
-			}
+
+		if eligible {
+			candidates = append(candidates, artifactCandidate{
+				repository: repository,
+				digest:     digest,
+			})
+			continue
+		}
+
+		if modelArtifact.State != nil {
+			s.log.WithFields(logrus.Fields{
+				"model_id":       modelID,
+				"version_id":     versionID,
+				"artifact_state": string(*modelArtifact.State),
+			}).Debug("artifact excluded by lifecycle policy")
 		}
 	}
 
-	switch len(eligible_) {
+	switch len(candidates) {
 	case 0:
 		return nil, fmt.Errorf(
-			"registered model id=%s name=%q, version id=%s name=%q: "+
-				"no eligible model-artifact found (requires exactly one artifact with "+
-				"artifactType=model-artifact, a valid OCI uri pinned with @sha256: digest, "+
-				"and an eligible state — see Open Question 9.4 for state policy)",
-			modelID, modelName, versionID, ver.Name)
+			"registered model id=%s name=%q, "+
+				"version id=%s name=%q: no eligible model-artifact "+
+				"found; exactly one model-artifact with an immutable "+
+				"OCI sha256 digest and lifecycle state LIVE, UNKNOWN, "+
+				"or absent is required",
+			modelID,
+			modelName,
+			versionID,
+			version.Name,
+		)
+
 	case 1:
 		return &collectedVersion{
-			version:    ver,
-			repository: eligible_[0].repo,
-			digest:     eligible_[0].digest,
+			version:    version,
+			repository: candidates[0].repository,
+			digest:     candidates[0].digest,
 		}, nil
+
 	default:
 		return nil, fmt.Errorf(
-			"registered model id=%s name=%q, version id=%s name=%q: "+
-				"found %d eligible model-artifacts but expected exactly one; "+
-				"resolve the ambiguity upstream",
-			modelID, modelName, versionID, ver.Name, len(eligible_))
+			"registered model id=%s name=%q, "+
+				"version id=%s name=%q: found %d eligible "+
+				"model-artifacts but exactly one is required; "+
+				"resolve the ambiguity in the Model Registry",
+			modelID,
+			modelName,
+			versionID,
+			version.Name,
+			len(candidates),
+		)
 	}
 }
 
-// fetchAllArtifacts paginates GET /model_versions/{id}/artifacts?artifactType=model-artifact.
-func (s *source) fetchAllArtifacts(ctx context.Context, versionID string) ([]mrapi.Artifact, error) {
-	var all []mrapi.Artifact
-	token := ""
-	seen := map[string]bool{"": true}
+// fetchAllArtifacts retrieves every page of model-artifact resources belonging
+// to one ModelVersion.
+func (s *source) fetchAllArtifacts(
+	ctx context.Context,
+	versionID string,
+) ([]mrapi.Artifact, error) {
+	artifacts := make([]mrapi.Artifact, 0)
+	nextPageToken := ""
+	seenTokens := make(map[string]struct{})
 
 	for {
-		list, err := s.client.ListModelArtifacts(ctx, versionID, token)
+		list, err := s.client.ListModelArtifacts(
+			ctx,
+			versionID,
+			nextPageToken,
+		)
 		if err != nil {
-			return nil, s.wrapHTTPError(fmt.Sprintf("listing artifacts for version id=%s", versionID), err)
+			return nil, s.wrapHTTPError(
+				fmt.Sprintf(
+					"listing artifacts for model version id=%s",
+					versionID,
+				),
+				err,
+			)
 		}
-		all = append(all, list.Items...)
+		if list == nil {
+			return nil, fmt.Errorf(
+				"listing artifacts for model version id=%s "+
+					"returned no response",
+				versionID,
+			)
+		}
+
+		artifacts = append(artifacts, list.Items...)
 
 		next := list.NextPageToken
 		if next == "" {
-			break
+			return artifacts, nil
 		}
-		if seen[next] {
-			return nil, fmt.Errorf("pagination loop: server returned repeated nextPageToken %q when listing artifacts for version id=%s", next, versionID)
+		if _, found := seenTokens[next]; found {
+			return nil, fmt.Errorf(
+				"pagination loop while listing artifacts for "+
+					"model version id=%s: the server repeated "+
+					"a nextPageToken",
+				versionID,
+			)
 		}
-		seen[next] = true
-		token = next
+
+		seenTokens[next] = struct{}{}
+		nextPageToken = next
 	}
-	return all, nil
 }
 
-// extractModelArtifact unwraps the polymorphic Artifact wrapper.
-func extractModelArtifact(a mrapi.Artifact) (*mrapi.ModelArtifact, bool) {
-	if a.ModelArtifact != nil {
-		return a.ModelArtifact, true
+// extractModelArtifact unwraps the generated polymorphic Artifact value.
+func extractModelArtifact(
+	artifact mrapi.Artifact,
+) (*mrapi.ModelArtifact, bool) {
+	if artifact.ModelArtifact == nil {
+		return nil, false
 	}
-	return nil, false
+
+	return artifact.ModelArtifact, true
 }
 
-// wrapHTTPError enriches transport / HTTP errors with actionable context while
-// never leaking credentials, tokens, or authorization headers.
-func (s *source) wrapHTTPError(op string, err error) error {
+// wrapHTTPError adds operation context while ensuring that Model Registry
+// response bodies, credentials, and Authorization headers are never included.
+//
+// Generated non-2xx responses use GenericOpenAPIError, whose body may contain
+// upstream implementation details. Those errors are deliberately replaced by
+// a sanitized operational error.
+func (s *source) wrapHTTPError(
+	operation string,
+	err error,
+) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("%s: %w", op, err)
+
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s: %w", operation, err)
 	}
 
-	// Check for HTTP error responses via the openapi GenericOpenAPIError type.
 	var openAPIErr *mrapi.GenericOpenAPIError
 	if errors.As(err, &openAPIErr) {
-		// Body() may contain sensitive information; do not include it.
-		return fmt.Errorf("%s: HTTP error from Model Registry (check registry connectivity and RBAC binding)", op)
+		return fmt.Errorf(
+			"%s: Model Registry HTTP request failed; "+
+				"check endpoint connectivity, credentials, and RBAC",
+			operation,
+		)
 	}
 
-	return fmt.Errorf("%s: %w", op, err)
+	// Transport, TLS and context errors do not include configured
+	// Authorization headers. Config validation rejects endpoint user
+	// information, query parameters and fragments.
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
-// computeRevision returns a deterministic content hash of the snapshot.
-// Resources are sorted before hashing so the revision is stable regardless of
-// upstream ordering.
-func computeRevision(catalogs []apiv1alpha1.Catalog, items []apiv1alpha1.CatalogItem) string {
-	// Sort catalogs by name.
-	sort.Slice(catalogs, func(i, j int) bool {
-		return ptrStr(catalogs[i].Metadata.Name) < ptrStr(catalogs[j].Metadata.Name)
-	})
-	// Sort items by catalog + name.
-	sort.Slice(items, func(i, j int) bool {
-		ki := items[i].Metadata.Catalog + "/" + ptrStr(items[i].Metadata.Name)
-		kj := items[j].Metadata.Catalog + "/" + ptrStr(items[j].Metadata.Name)
-		return ki < kj
+// computeRevision returns a stable, abbreviated SHA-256 hash of the complete
+// desired snapshot.
+//
+// Copies are sorted before marshaling so hashing never mutates the snapshot
+// returned to the pipeline. Complete resources, including Catalog identity,
+// are hashed. Including Catalog identity matters when the registry contains no
+// CatalogItems.
+func computeRevision(
+	catalogs []apiv1alpha1.Catalog,
+	items []apiv1alpha1.CatalogItem,
+) (string, error) {
+	sortedCatalogs := append(
+		[]apiv1alpha1.Catalog(nil),
+		catalogs...,
+	)
+	sortedItems := append(
+		[]apiv1alpha1.CatalogItem(nil),
+		items...,
+	)
+
+	sort.Slice(sortedCatalogs, func(i, j int) bool {
+		return ptrStr(sortedCatalogs[i].Metadata.Name) <
+			ptrStr(sortedCatalogs[j].Metadata.Name)
 	})
 
-	h := sha256.New()
-	enc := json.NewEncoder(h)
-	for i := range catalogs {
-		_ = enc.Encode(catalogs[i].Spec)
+	sort.Slice(sortedItems, func(i, j int) bool {
+		left := sortedItems[i].Metadata.Catalog +
+			"/" +
+			ptrStr(sortedItems[i].Metadata.Name)
+		right := sortedItems[j].Metadata.Catalog +
+			"/" +
+			ptrStr(sortedItems[j].Metadata.Name)
+
+		return left < right
+	})
+
+	canonical := struct {
+		Catalogs     []apiv1alpha1.Catalog     `json:"catalogs"`
+		CatalogItems []apiv1alpha1.CatalogItem `json:"catalogItems"`
+	}{
+		Catalogs:     sortedCatalogs,
+		CatalogItems: sortedItems,
 	}
-	for i := range items {
-		_ = enc.Encode(ptrStr(items[i].Metadata.Name))
-		_ = enc.Encode(items[i].Metadata.Catalog)
-		_ = enc.Encode(items[i].Spec)
+
+	data, err := json.Marshal(canonical)
+	if err != nil {
+		return "", fmt.Errorf(
+			"marshaling canonical snapshot: %w",
+			err,
+		)
 	}
-	return hex.EncodeToString(h.Sum(nil))[:16]
+
+	sum := sha256.Sum256(data)
+
+	// Preserve the existing 16-character revision representation while deriving
+	// it from the complete canonical snapshot.
+	return hex.EncodeToString(sum[:])[:16], nil
 }

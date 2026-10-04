@@ -3,288 +3,402 @@ package kubeflowmodelregistrysource
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	mrapi "github.com/kubeflow/hub/pkg/openapi"
 
 	apiv1alpha1 "github.com/flightctl/flightctl/api/core/v1alpha1"
 	apiv1beta1 "github.com/flightctl/flightctl/api/core/v1beta1"
+	internalvalidation "github.com/flightctl/flightctl/internal/util/validation"
 )
 
-// eligibleArtifactStates is the set of ArtifactState values that make a
-// model-artifact eligible for collection.
+// eligibleArtifactStates contains the ModelArtifact lifecycle states accepted
+// for synchronization.
 //
-// OPEN QUESTION 9.4: ArtifactState defaults to UNKNOWN for ModelArtifact.
-// Real RHOAI-created ModelCar artifacts may carry LIVE or remain UNKNOWN.
-// This set is an explicit interim policy; validate against a real RHOAI
-// deployment and update before GA. Nil state (absent field) is treated as
-// UNKNOWN.
+// Validation against RHOAI 3.5.1 using the Model Registry v1alpha3 API showed
+// that RHOAI-created ModelCar artifacts omit the state field. An absent state
+// is therefore treated as UNKNOWN. LIVE and UNKNOWN artifacts are eligible;
+// lifecycle states such as ABANDONED are not.
 var eligibleArtifactStates = map[mrapi.ArtifactState]bool{
 	mrapi.ARTIFACTSTATE_LIVE:    true,
 	mrapi.ARTIFACTSTATE_UNKNOWN: true,
 }
 
-// ociDigestRe matches a valid OCI digest: sha256: followed by exactly 64
-// lowercase hex characters (OCI image-spec v1.1.0).
+// ociDigestRe matches the immutable digest format currently supported by the
+// Flightctl model deployment path.
 var ociDigestRe = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 
-// collectedModel is the normalized intermediate representation of a registered
-// model and all its eligible versions before being converted to a CatalogItem.
+// semverRe implements the SemVer 2.0.0 grammar. A leading "v" is deliberately
+// not accepted because registry version names are not silently rewritten.
+var semverRe = regexp.MustCompile(
+	`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)` +
+		`(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?` +
+		`(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$`,
+)
+
+// collectedModel is the normalized intermediate representation of a
+// RegisteredModel and its eligible versions.
 type collectedModel struct {
 	model    mrapi.RegisteredModel
 	versions []collectedVersion
 }
 
-// collectedVersion is the normalized intermediate representation of a model
-// version and its single eligible artifact.
+// collectedVersion is the normalized intermediate representation of a
+// ModelVersion and its single eligible ModelArtifact.
 type collectedVersion struct {
 	version    mrapi.ModelVersion
-	repository string // version-less OCI repository (scheme stripped)
-	digest     string // sha256:… reference
+	repository string
+	digest     string
 }
 
-// toSnapshot converts a slice of collected models into the Catalog and
-// CatalogItems that form the snapshot.
+// toSnapshot converts collected models into a complete desired-state Catalog
+// snapshot.
 //
-// It enforces all mapping invariants (shared repository, collision detection)
-// and fails the whole snapshot on any violation.
-func toSnapshot(catalogName string, models []collectedModel) ([]apiv1alpha1.Catalog, []apiv1alpha1.CatalogItem, error) {
+// The caller omits registered models that have no LIVE versions. Any model
+// passed to this function must therefore contain at least one eligible version.
+// Violating a mapping invariant fails the complete snapshot.
+func toSnapshot(
+	catalogName string,
+	models []collectedModel,
+) ([]apiv1alpha1.Catalog, []apiv1alpha1.CatalogItem, error) {
 	catalog := buildCatalog(catalogName)
-
-	seenNames := make(map[string]string) // normalized name → original name
+	seenNames := make(map[string]string, len(models))
 	items := make([]apiv1alpha1.CatalogItem, 0, len(models))
 
-	for _, m := range models {
-		item, err := toItem(catalogName, m, seenNames)
+	for _, model := range models {
+		item, err := toItem(catalogName, model, seenNames)
 		if err != nil {
 			return nil, nil, err
 		}
 		items = append(items, item)
 	}
 
+	// Canonicalize output independently of the order returned by the upstream
+	// API. This keeps snapshot hashing stable across otherwise equivalent
+	// collection cycles.
+	sort.Slice(items, func(i, j int) bool {
+		return ptrStr(items[i].Metadata.Name) <
+			ptrStr(items[j].Metadata.Name)
+	})
+
 	return []apiv1alpha1.Catalog{catalog}, items, nil
 }
 
 func buildCatalog(name string) apiv1alpha1.Catalog {
-	dn := name
 	return apiv1alpha1.Catalog{
 		ApiVersion: "flightctl.io/v1alpha1",
 		Kind:       "Catalog",
 		Metadata: apiv1beta1.ObjectMeta{
-			Name: &name,
+			Name: ptr(name),
 		},
 		Spec: apiv1alpha1.CatalogSpec{
-			DisplayName: &dn,
+			DisplayName: ptr(name),
 		},
 	}
 }
 
-func toItem(catalogName string, m collectedModel, seenNames map[string]string) (apiv1alpha1.CatalogItem, error) {
-	normalized, err := normalizeName(m.model.Name)
+func toItem(
+	catalogName string,
+	model collectedModel,
+	seenNames map[string]string,
+) (apiv1alpha1.CatalogItem, error) {
+	normalizedName, err := normalizeName(model.model.Name)
 	if err != nil {
-		id := safeID(m.model.Id)
 		return apiv1alpha1.CatalogItem{}, fmt.Errorf(
-			"registered model id=%s name=%q: name normalization failed: %w", id, m.model.Name, err)
+			"registered model id=%s name=%q: name normalization failed: %w",
+			safeID(model.model.Id),
+			model.model.Name,
+			err,
+		)
 	}
 
-	if original, seen := seenNames[normalized]; seen {
+	if originalName, found := seenNames[normalizedName]; found {
 		return apiv1alpha1.CatalogItem{}, fmt.Errorf(
-			"name collision: models %q and %q both normalize to %q; "+
-				"rename one of them to disambiguate",
-			original, m.model.Name, normalized)
+			"name collision: registered models %q and %q both normalize to %q; "+
+				"rename one of the models to disambiguate them",
+			originalName,
+			model.model.Name,
+			normalizedName,
+		)
 	}
-	seenNames[normalized] = m.model.Name
+	seenNames[normalizedName] = model.model.Name
 
-	// Determine the shared OCI repository from all eligible versions.
-	sharedRepo, err := sharedRepository(m)
+	repository, err := sharedRepository(model)
 	if err != nil {
 		return apiv1alpha1.CatalogItem{}, err
 	}
 
-	// Build version list.
-	versions, err := toVersions(m)
+	versions, err := toVersions(model)
 	if err != nil {
 		return apiv1alpha1.CatalogItem{}, err
 	}
 
-	// Build the item spec.
 	spec := apiv1alpha1.CatalogItemSpec{
 		Type:     apiv1alpha1.CatalogItemTypeData,
 		Category: ptr(apiv1alpha1.CatalogItemCategoryApplication),
 		Artifacts: []apiv1alpha1.CatalogItemArtifact{
 			{
 				Type: apiv1alpha1.CatalogItemArtifactTypeContainer,
-				Uri:  sharedRepo,
+				Uri:  repository,
 			},
 		},
 		Versions:    versions,
-		DisplayName: &m.model.Name,
+		DisplayName: ptr(model.model.Name),
 	}
-	if m.model.Description != nil && *m.model.Description != "" {
-		spec.ShortDescription = m.model.Description
+
+	if model.model.Description != nil &&
+		strings.TrimSpace(*model.model.Description) != "" {
+		spec.ShortDescription = ptr(*model.model.Description)
 	}
-	if p := modelProvider(m.model); p != "" {
-		spec.Provider = &p
+
+	if provider := modelProvider(model.model); provider != "" {
+		spec.Provider = ptr(provider)
 	}
 
 	return apiv1alpha1.CatalogItem{
 		ApiVersion: "flightctl.io/v1alpha1",
 		Kind:       "CatalogItem",
 		Metadata: apiv1alpha1.CatalogItemMeta{
-			Name:    &normalized,
+			Name:    ptr(normalizedName),
 			Catalog: catalogName,
 		},
 		Spec: spec,
 	}, nil
 }
 
-// sharedRepository ensures all eligible versions of a model resolve to the
-// same version-less OCI repository. Returns an error if any version diverges.
-func sharedRepository(m collectedModel) (string, error) {
-	if len(m.versions) == 0 {
-		return "", fmt.Errorf("registered model id=%s name=%q has no eligible versions",
-			safeID(m.model.Id), m.model.Name)
+// sharedRepository verifies that all eligible versions of one model use the
+// same version-less OCI repository. CatalogItem stores the repository once and
+// stores each version's digest in its references map, so different repositories
+// cannot be represented safely.
+func sharedRepository(model collectedModel) (string, error) {
+	if len(model.versions) == 0 {
+		return "", fmt.Errorf(
+			"registered model id=%s name=%q has no eligible versions",
+			safeID(model.model.Id),
+			model.model.Name,
+		)
 	}
-	repo := m.versions[0].repository
-	for _, v := range m.versions[1:] {
-		if v.repository != repo {
+
+	repository := model.versions[0].repository
+	for _, version := range model.versions[1:] {
+		if version.repository != repository {
 			return "", fmt.Errorf(
-				"registered model id=%s name=%q: version %q resolves to repository %q "+
-					"but version %q resolves to repository %q; all versions of a model must "+
-					"share the same OCI repository",
-				safeID(m.model.Id), m.model.Name,
-				m.versions[0].version.Name, repo,
-				v.version.Name, v.repository)
+				"registered model id=%s name=%q: versions %q and %q use "+
+					"different OCI repositories; all versions of one model "+
+					"must share a repository",
+				safeID(model.model.Id),
+				model.model.Name,
+				model.versions[0].version.Name,
+				version.version.Name,
+			)
 		}
 	}
-	return repo, nil
+
+	return repository, nil
 }
 
-// toVersions converts a collectedModel's versions to CatalogItemVersion entries.
-func toVersions(m collectedModel) ([]apiv1alpha1.CatalogItemVersion, error) {
-	versions := make([]apiv1alpha1.CatalogItemVersion, 0, len(m.versions))
-	for _, v := range m.versions {
-		if !isValidSemVer(v.version.Name) {
+// toVersions converts eligible ModelVersions into CatalogItemVersion entries.
+// Duplicate version names are rejected because they cannot be represented
+// unambiguously in one CatalogItem.
+func toVersions(
+	model collectedModel,
+) ([]apiv1alpha1.CatalogItemVersion, error) {
+	versions := make([]apiv1alpha1.CatalogItemVersion, 0, len(model.versions))
+	seenVersions := make(map[string]string, len(model.versions))
+
+	for _, collected := range model.versions {
+		versionName := collected.version.Name
+		if !isValidSemVer(versionName) {
 			return nil, fmt.Errorf(
 				"registered model id=%s name=%q, version id=%s name=%q: "+
-					"version name is not valid strict SemVer; "+
-					"rename it in the Model Registry to a valid SemVer string",
-				safeID(m.model.Id), m.model.Name,
-				safeID(v.version.Id), v.version.Name)
+					"version name is not valid SemVer 2.0.0; rename it in "+
+					"the Model Registry rather than relying on normalization",
+				safeID(model.model.Id),
+				model.model.Name,
+				safeID(collected.version.Id),
+				versionName,
+			)
 		}
+
+		if previousID, found := seenVersions[versionName]; found {
+			return nil, fmt.Errorf(
+				"registered model id=%s name=%q has duplicate version name %q "+
+					"on version ids %s and %s",
+				safeID(model.model.Id),
+				model.model.Name,
+				versionName,
+				previousID,
+				safeID(collected.version.Id),
+			)
+		}
+		seenVersions[versionName] = safeID(collected.version.Id)
+
 		versions = append(versions, apiv1alpha1.CatalogItemVersion{
-			Version:  apiv1alpha1.SemVer(v.version.Name),
+			Version:  apiv1alpha1.SemVer(versionName),
 			Channels: []string{"stable"},
 			References: map[apiv1alpha1.CatalogItemArtifactType]string{
-				apiv1alpha1.CatalogItemArtifactTypeContainer: v.digest,
+				apiv1alpha1.CatalogItemArtifactTypeContainer: collected.digest,
 			},
 		})
 	}
+
+	// Canonicalize version order so snapshot revisions do not depend on API
+	// pagination or insertion order.
+	sort.Slice(versions, func(i, j int) bool {
+		return versions[i].Version < versions[j].Version
+	})
+
 	return versions, nil
 }
 
-// splitArtifactURI parses an artifact URI into a version-less repository and a
-// digest. The uri may have an optional "oci://" scheme prefix which is stripped.
-// The URI must contain "@sha256:" followed by exactly 64 lowercase hex chars.
+// splitArtifactURI splits a digest-pinned OCI reference into the version-less
+// repository stored in CatalogItem.spec.artifacts and the digest stored in the
+// version's references map.
 //
-// Returns the repository (without scheme) and the digest (sha256:…).
-func splitArtifactURI(uri string) (repo, digest string, err error) {
-	// Strip optional oci:// scheme.
-	rawURI := strings.TrimPrefix(uri, "oci://")
-	if rawURI == "" {
-		return "", "", fmt.Errorf("URI is empty after stripping scheme")
+// An optional "oci://" prefix is accepted and removed. Tags are allowed only
+// when the same reference is also pinned by digest; the tag is discarded.
+// Error messages deliberately avoid including the supplied URI because an
+// invalid URI could contain secret material.
+func splitArtifactURI(uri string) (repository, digest string, err error) {
+	if uri == "" {
+		return "", "", fmt.Errorf("artifact URI is empty")
 	}
-
-	// Split on "@".
-	atIdx := strings.LastIndex(rawURI, "@")
-	if atIdx < 0 {
-		return "", "", fmt.Errorf("URI %q does not contain a digest (no '@')", uri)
-	}
-	candidateRepo := rawURI[:atIdx]
-	candidateDigest := rawURI[atIdx+1:]
-
-	if !ociDigestRe.MatchString(candidateDigest) {
+	if strings.TrimSpace(uri) != uri {
 		return "", "", fmt.Errorf(
-			"URI %q: digest %q is not a valid sha256 digest (expected sha256:[a-f0-9]{64})",
-			uri, candidateDigest)
+			"artifact URI must not contain leading or trailing whitespace",
+		)
 	}
-	if candidateRepo == "" {
-		return "", "", fmt.Errorf("URI %q: repository part is empty", uri)
+
+	rawURI := uri
+	if strings.HasPrefix(rawURI, "oci://") {
+		rawURI = strings.TrimPrefix(rawURI, "oci://")
+	} else if strings.Contains(rawURI, "://") {
+		return "", "", fmt.Errorf(
+			"artifact URI uses an unsupported scheme; only an optional oci:// prefix is supported",
+		)
 	}
-	return candidateRepo, candidateDigest, nil
+
+	if rawURI == "" {
+		return "", "", fmt.Errorf(
+			"artifact URI contains no OCI image reference",
+		)
+	}
+
+	if strings.Count(rawURI, "@") != 1 {
+		return "", "", fmt.Errorf(
+			"artifact URI must contain exactly one immutable digest separator",
+		)
+	}
+
+	at := strings.LastIndexByte(rawURI, '@')
+	if at <= 0 || at == len(rawURI)-1 {
+		return "", "", fmt.Errorf(
+			"artifact URI must include both an OCI repository and digest",
+		)
+	}
+
+	digest = rawURI[at+1:]
+	if !ociDigestRe.MatchString(digest) {
+		return "", "", fmt.Errorf(
+			"artifact URI digest must be sha256 followed by exactly 64 lowercase hexadecimal characters",
+		)
+	}
+
+	matches := internalvalidation.StrictOciImageReferenceRegexp.FindStringSubmatch(
+		rawURI,
+	)
+	if len(matches) != 4 {
+		return "", "", fmt.Errorf(
+			"artifact URI is not a valid fully qualified OCI image reference",
+		)
+	}
+
+	repository = matches[1]
+	parsedDigest := matches[3]
+	if repository == "" || parsedDigest != digest {
+		return "", "", fmt.Errorf(
+			"artifact URI could not be separated into a repository and digest",
+		)
+	}
+
+	return repository, digest, nil
 }
 
-// isEligibleArtifact returns true when the artifact satisfies the eligibility
-// criteria: artifactType==model-artifact, non-empty OCI URI with a valid
-// sha256 digest, and an eligible artifact state.
+// isEligibleArtifact evaluates the artifact type and lifecycle state, then
+// validates its immutable OCI reference.
 //
-// The eligibleArtifactStates var encodes the unresolved Open Question 9.4.
-func isEligibleArtifact(a *mrapi.ModelArtifact) (repo, digest string, ok bool, err error) {
-	// Check artifact type discriminator.
-	if a.ArtifactType == nil || *a.ArtifactType != "model-artifact" {
+// Artifacts of another type or lifecycle state are ignored. A model-artifact
+// in an eligible state with an invalid URI is an actionable data error and
+// therefore fails the complete collection cycle.
+func isEligibleArtifact(
+	artifact *mrapi.ModelArtifact,
+) (repository, digest string, eligible bool, err error) {
+	if artifact == nil {
 		return "", "", false, nil
 	}
 
-	// Check state. nil state is treated as UNKNOWN (the default per the spec).
-	var state mrapi.ArtifactState
-	if a.State != nil {
-		state = *a.State
-	} else {
-		state = mrapi.ARTIFACTSTATE_UNKNOWN
+	if artifact.ArtifactType == nil ||
+		*artifact.ArtifactType != "model-artifact" {
+		return "", "", false, nil
+	}
+
+	state := mrapi.ARTIFACTSTATE_UNKNOWN
+	if artifact.State != nil {
+		state = *artifact.State
 	}
 	if !eligibleArtifactStates[state] {
 		return "", "", false, nil
 	}
 
-	// Check URI.
-	if a.Uri == nil || *a.Uri == "" {
+	if artifact.Uri == nil || strings.TrimSpace(*artifact.Uri) == "" {
 		return "", "", false, nil
 	}
 
-	repo, digest, err = splitArtifactURI(*a.Uri)
+	repository, digest, err = splitArtifactURI(*artifact.Uri)
 	if err != nil {
-		return "", "", false, fmt.Errorf("artifact uri: %w", err)
+		return "", "", false, fmt.Errorf(
+			"model artifact id=%s has an invalid immutable OCI reference: %w",
+			safeID(artifact.Id),
+			err,
+		)
 	}
-	return repo, digest, true, nil
+
+	return repository, digest, true, nil
 }
 
-// isValidSemVer returns true if s is a valid strict SemVer string. It does not
-// accept a leading 'v' prefix.
-//
-// Strict SemVer grammar: MAJOR.MINOR.PATCH(-pre)?(+build)? where each of
-// MAJOR, MINOR, PATCH is a non-negative integer with no leading zeros.
-var semverRe = regexp.MustCompile(
-	`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)` +
-		`(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?` +
-		`(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`,
-)
-
-func isValidSemVer(s string) bool {
-	return semverRe.MatchString(s)
+func isValidSemVer(version string) bool {
+	return semverRe.MatchString(version)
 }
 
-func modelProvider(m mrapi.RegisteredModel) string {
-	if m.Owner != nil && *m.Owner != "" {
-		return *m.Owner
+func modelProvider(model mrapi.RegisteredModel) string {
+	if model.Owner != nil {
+		if owner := strings.TrimSpace(*model.Owner); owner != "" {
+			return owner
+		}
 	}
-	if m.Provider != nil && *m.Provider != "" {
-		return *m.Provider
+	if model.Provider != nil {
+		if provider := strings.TrimSpace(*model.Provider); provider != "" {
+			return provider
+		}
 	}
 	return ""
 }
 
 func safeID(id *string) string {
-	if id == nil {
-		return "<nil>"
+	if id == nil || strings.TrimSpace(*id) == "" {
+		return "<unknown>"
 	}
 	return *id
 }
 
-func ptr[T any](v T) *T { return &v }
+func ptr[T any](value T) *T {
+	return &value
+}
 
-func ptrStr(s *string) string {
-	if s == nil {
+func ptrStr(value *string) string {
+	if value == nil {
 		return ""
 	}
-	return *s
+	return *value
 }

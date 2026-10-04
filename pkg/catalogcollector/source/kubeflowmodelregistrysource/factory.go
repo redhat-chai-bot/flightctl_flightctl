@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	mrapi "github.com/kubeflow/hub/pkg/openapi"
 
@@ -46,51 +45,55 @@ func (f *factory) CreateSource(
 ) (catalogcollector.Source, error) {
 	c, ok := cfg.(*Config)
 	if !ok {
-		return nil, fmt.Errorf("source %q: unexpected config type %T", settings.ID, cfg)
+		return nil, fmt.Errorf(
+			"source %q: unexpected config type %T",
+			settings.ID,
+			cfg,
+		)
 	}
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("source %q: %w", settings.ID, err)
 	}
+	if settings.Logger == nil {
+		return nil, fmt.Errorf("source %q: logger must not be nil", settings.ID)
+	}
+	if settings.MeterProvider == nil {
+		return nil, fmt.Errorf(
+			"source %q: meter provider must not be nil",
+			settings.ID,
+		)
+	}
+	if next == nil {
+		return nil, fmt.Errorf(
+			"source %q: downstream consumer must not be nil",
+			settings.ID,
+		)
+	}
 
-	// Build the TLS transport.
 	baseTransport, err := buildTransport(c)
 	if err != nil {
-		return nil, fmt.Errorf("source %q: building TLS transport: %w", settings.ID, err)
+		return nil, fmt.Errorf(
+			"source %q: building HTTP transport: %w",
+			settings.ID,
+			err,
+		)
 	}
 
-	// Wrap the base transport with the auth RoundTripper when auth is configured.
-	// Auth is optional; when absent the base transport is used as-is.
-	authedTransport := http.RoundTripper(baseTransport)
-	if c.Auth != nil && strings.TrimSpace(c.Auth.Authenticator) != "" {
-		authID, err := catalogcollector.ParseComponentID(c.Auth.Authenticator)
-		if err != nil {
-			return nil, fmt.Errorf("source %q: auth.authenticator %q is not a valid component ID: %w",
-				settings.ID, c.Auth.Authenticator, err)
-		}
-		ext, err := settings.Host.GetExtension(authID)
-		if err != nil {
-			return nil, fmt.Errorf("source %q: resolving auth extension %q: %w", settings.ID, authID, err)
-		}
-		authClient, ok := ext.(extensionauth.HTTPClient)
-		if !ok {
-			return nil, fmt.Errorf("source %q: extension %q does not implement extensionauth.HTTPClient",
-				settings.ID, authID)
-		}
-		authedTransport, err = authClient.RoundTripper(baseTransport)
-		if err != nil {
-			return nil, fmt.Errorf("source %q: building auth transport: %w", settings.ID, err)
-		}
+	transport, err := buildAuthTransport(settings, c, baseTransport)
+	if err != nil {
+		return nil, err
 	}
 
-	// Build the openapi client with the fully composed transport.
 	apiCfg := mrapi.NewConfiguration()
-	// The SDK-generated client already prepends /api/model_registry/v1alpha3/ to
-	// every request path, so the server URL must be just the base endpoint.
+
+	// The generated client adds the Model Registry v1alpha3 API path to every
+	// request. The configured server URL therefore contains only the registry
+	// endpoint and any deployment-specific reverse-proxy prefix.
 	apiCfg.Servers = mrapi.ServerConfigurations{{
-		URL: c.Endpoint,
+		URL: strings.TrimRight(c.Endpoint, "/"),
 	}}
 	apiCfg.HTTPClient = &http.Client{
-		Transport: authedTransport,
+		Transport: transport,
 		Timeout:   c.requestTimeout(),
 	}
 
@@ -99,20 +102,25 @@ func (f *factory) CreateSource(
 		pageSize: fmt.Sprintf("%d", c.pageSize()),
 	}
 
-	// Build the metrics instruments.
-	metrics, err := newMetrics(settings.ID.String(), settings.MeterProvider)
+	metrics, err := newMetrics(
+		settings.ID.String(),
+		settings.MeterProvider,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("source %q: creating metrics: %w", settings.ID, err)
+		return nil, fmt.Errorf(
+			"source %q: creating metrics: %w",
+			settings.ID,
+			err,
+		)
 	}
 
-	// Build the poll helper.
 	poller := pollsource.NewHelper(
 		settings.ID.String(),
 		c.pollInterval(),
 		c.Backoff,
 		settings.Logger,
-		nil, // use production time.Now
-		nil, // use production rand jitter
+		nil, // Use the production clock.
+		nil, // Use production random jitter.
 	)
 	poller.OnSuccess = metrics.recordSuccess
 	poller.OnFailure = metrics.recordFailure
@@ -129,33 +137,106 @@ func (f *factory) CreateSource(
 	}, nil
 }
 
-// buildTransport constructs a TLS-aware base HTTP transport for the source.
-// CA trust is configured separately from the authentication wrapper.
-func buildTransport(c *Config) (http.RoundTripper, error) {
-	tlsCfg := &tls.Config{
-		InsecureSkipVerify: c.InsecureSkipVerify, //nolint:gosec // operator-controlled dev flag
+func buildAuthTransport(
+	settings catalogcollector.Settings,
+	cfg *Config,
+	base http.RoundTripper,
+) (http.RoundTripper, error) {
+	if cfg.Auth == nil {
+		return base, nil
+	}
+	if settings.Host == nil {
+		return nil, fmt.Errorf(
+			"source %q: auth.authenticator %q requires a host but none is available",
+			settings.ID,
+			cfg.Auth.Authenticator,
+		)
 	}
 
-	if c.CertificateAuthority != "" {
-		pem, err := os.ReadFile(c.CertificateAuthority)
-		if err != nil {
-			return nil, fmt.Errorf("reading certificateAuthority %q: %w", c.CertificateAuthority, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("certificateAuthority %q contained no valid certificates", c.CertificateAuthority)
-		}
-		tlsCfg.RootCAs = pool
+	authID, err := catalogcollector.ParseComponentID(
+		cfg.Auth.Authenticator,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"source %q: invalid auth.authenticator %q: %w",
+			settings.ID,
+			cfg.Auth.Authenticator,
+			err,
+		)
 	}
 
-	return &http.Transport{
-		TLSClientConfig:    tlsCfg,
-		MaxIdleConns:       10,
-		IdleConnTimeout:    90 * time.Second,
-		DisableCompression: false,
-		ForceAttemptHTTP2:  true,
-	}, nil
+	ext, err := settings.Host.GetExtension(authID)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"source %q: resolving authenticator %q: %w",
+			settings.ID,
+			authID,
+			err,
+		)
+	}
+
+	authClient, ok := ext.(extensionauth.HTTPClient)
+	if !ok {
+		return nil, fmt.Errorf(
+			"source %q: extension %q does not implement extensionauth.HTTPClient",
+			settings.ID,
+			authID,
+		)
+	}
+
+	transport, err := authClient.RoundTripper(base)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"source %q: building transport for authenticator %q: %w",
+			settings.ID,
+			authID,
+			err,
+		)
+	}
+
+	return transport, nil
 }
 
-// Ensure config.Validator is satisfied at compile time.
-var _ config.Validator = (*Config)(nil)
+// buildTransport constructs the TLS-aware base HTTP transport used by the
+// source. Authentication, when configured, is layered on top of this
+// transport.
+func buildTransport(cfg *Config) (*http.Transport, error) {
+	tlsConfig := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: cfg.InsecureSkipVerify, //nolint:gosec
+	}
+
+	if cfg.CertificateAuthority != "" {
+		caCert, err := os.ReadFile(cfg.CertificateAuthority)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"reading CA certificate: %w",
+				err,
+			)
+		}
+
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf(
+				"CA certificate file contains no valid PEM certificates",
+			)
+		}
+		tlsConfig.RootCAs = pool
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsConfig
+	transport.Proxy = http.ProxyFromEnvironment
+	transport.ForceAttemptHTTP2 = true
+	transport.MaxIdleConnsPerHost = 10
+
+	return transport, nil
+}
+
+var (
+	_ catalogcollector.SourceFactory = (*factory)(nil)
+	_ config.Validator               = (*Config)(nil)
+)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -18,90 +19,151 @@ const (
 	lastSuccessTimestampName = "flightctl.catalogcollector.source.last_success.timestamp"
 )
 
+const sourceIDAttribute = "source.id"
+
 // sourceMetrics holds the per-source collection instruments.
 //
-// These are separate from the five service-owned pipeline instruments (which
-// fire only after a snapshot is delivered downstream); these record every
-// collection attempt including failures that occur before any snapshot exists.
+// These instruments are separate from the service-owned pipeline instruments,
+// which record work only after a source has produced a complete snapshot.
+// Source metrics record every collection attempt, including failures that
+// occur before a snapshot is emitted.
 type sourceMetrics struct {
 	sourceID string
 
-	collections      metric.Int64Counter
-	duration         metric.Float64Histogram
-	lastSuccessTS    int64 // Unix epoch seconds, updated after each success
+	collections metric.Int64Counter
+	duration    metric.Float64Histogram
+
+	// The observable gauge callback may execute concurrently with collection
+	// completion, so access to this value must be synchronized.
+	lastSuccessTS atomic.Int64
+
+	// Keep the observable instrument associated with this metrics instance for
+	// the lifetime of the source.
 	lastSuccessGauge metric.Int64ObservableGauge
 }
 
-func newMetrics(sourceID string, mp metric.MeterProvider) (*sourceMetrics, error) {
-	meter := mp.Meter(meterName)
+func newMetrics(
+	sourceID string,
+	meterProvider metric.MeterProvider,
+) (*sourceMetrics, error) {
+	if meterProvider == nil {
+		return nil, fmt.Errorf("meter provider must not be nil")
+	}
+
+	meter := meterProvider.Meter(meterName)
 
 	collections, err := meter.Int64Counter(
 		collectionCounterName,
-		metric.WithDescription("Number of collection attempts by the source"),
+		metric.WithDescription(
+			"Number of Model Registry collection attempts",
+		),
 		metric.WithUnit("{collection}"),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("creating %s counter: %w", collectionCounterName, err)
+		return nil, fmt.Errorf(
+			"creating %s counter: %w",
+			collectionCounterName,
+			err,
+		)
 	}
 
-	dur, err := meter.Float64Histogram(
+	duration, err := meter.Float64Histogram(
 		collectionDurationName,
-		metric.WithDescription("Duration of each collection cycle"),
+		metric.WithDescription(
+			"Duration of Model Registry collection attempts",
+		),
 		metric.WithUnit("s"),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("creating %s histogram: %w", collectionDurationName, err)
+		return nil, fmt.Errorf(
+			"creating %s histogram: %w",
+			collectionDurationName,
+			err,
+		)
 	}
 
-	m := &sourceMetrics{
+	metrics := &sourceMetrics{
 		sourceID:    sourceID,
 		collections: collections,
-		duration:    dur,
+		duration:    duration,
 	}
 
 	gauge, err := meter.Int64ObservableGauge(
 		lastSuccessTimestampName,
-		metric.WithDescription("Unix timestamp (seconds) of the last successful collection"),
+		metric.WithDescription(
+			"Unix timestamp in seconds of the last successful collection",
+		),
 		metric.WithUnit("s"),
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			ts := m.lastSuccessTS
-			if ts > 0 {
-				o.Observe(ts, metric.WithAttributes(attribute.String("source.id", m.sourceID)))
-			}
-			return nil
-		}),
+		metric.WithInt64Callback(
+			func(
+				_ context.Context,
+				observer metric.Int64Observer,
+			) error {
+				timestamp := metrics.lastSuccessTS.Load()
+				if timestamp == 0 {
+					return nil
+				}
+
+				observer.Observe(
+					timestamp,
+					metric.WithAttributes(
+						attribute.String(
+							sourceIDAttribute,
+							metrics.sourceID,
+						),
+					),
+				)
+				return nil
+			},
+		),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("creating %s gauge: %w", lastSuccessTimestampName, err)
+		return nil, fmt.Errorf(
+			"creating %s gauge: %w",
+			lastSuccessTimestampName,
+			err,
+		)
 	}
-	m.lastSuccessGauge = gauge
+	metrics.lastSuccessGauge = gauge
 
-	return m, nil
+	return metrics, nil
 }
 
-// recordSuccess records a successful collection cycle.
+// recordSuccess records a successful collection attempt and advances the
+// last-success timestamp.
 func (m *sourceMetrics) recordSuccess(elapsed time.Duration) {
-	ctx := context.Background()
-	attrs := metric.WithAttributes(
-		attribute.String("source.id", m.sourceID),
+	attributes := metric.WithAttributes(
+		attribute.String(sourceIDAttribute, m.sourceID),
 		attribute.String("outcome", "success"),
 	)
-	m.collections.Add(ctx, 1, attrs)
-	m.duration.Record(ctx, elapsed.Seconds(), attrs)
-	m.lastSuccessTS = time.Now().Unix()
+
+	ctx := context.Background()
+	m.collections.Add(ctx, 1, attributes)
+	m.duration.Record(ctx, elapsed.Seconds(), attributes)
+	m.lastSuccessTS.Store(time.Now().Unix())
 }
 
-// recordFailure records a failed collection cycle.
-func (m *sourceMetrics) recordFailure(elapsed time.Duration, err error) {
-	ctx := context.Background()
+// recordFailure records an unsuccessful collection attempt.
+//
+// Service cancellation is reported separately from operational failures.
+// Request and collection deadline expiration remains a failure because it
+// indicates that the Model Registry did not complete within its configured
+// timeout.
+func (m *sourceMetrics) recordFailure(
+	elapsed time.Duration,
+	err error,
+) {
 	outcome := "failure"
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
 		outcome = "cancelled"
 	}
-	attrs := metric.WithAttributes(
-		attribute.String("source.id", m.sourceID),
+
+	attributes := metric.WithAttributes(
+		attribute.String(sourceIDAttribute, m.sourceID),
 		attribute.String("outcome", outcome),
 	)
-	m.collections.Add(ctx, 1, attrs)
-	m.duration.Record(ctx, elapsed.Seconds(), attrs)
+
+	ctx := context.Background()
+	m.collections.Add(ctx, 1, attributes)
+	m.duration.Record(ctx, elapsed.Seconds(), attributes)
 }

@@ -1,15 +1,16 @@
 // Package pollsource provides a reusable polling loop with bounded exponential
 // backoff and jitter for pull-based catalog collector sources.
 //
-// Any pull source supplies a collect callback and receives the poll loop,
-// backoff, cancellation, and collection-metrics behavior without touching the
-// shared pipeline. Process readiness is not managed here; it is owned by the
-// healthcheck extension.
+// A pull source supplies a collection callback and receives polling, backoff,
+// cancellation, and collection-attempt notification behavior without coupling
+// that behavior to the shared pipeline. Process readiness is not managed here;
+// it is owned by the healthcheck extension.
 package pollsource
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"time"
 
@@ -18,75 +19,106 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// CollectFunc is the signature of a complete-snapshot collection function.
-// On error the source must not have emitted any partial state to the consumer;
-// the helper discards the result and applies backoff.
-type CollectFunc func(ctx context.Context) (*catalogcollector.CatalogSnapshot, error)
+// CollectFunc performs one complete collection cycle.
+//
+// A successful call returns one complete desired-state snapshot. An error must
+// return no usable partial snapshot; the helper does not forward a snapshot
+// when collection fails.
+type CollectFunc func(
+	ctx context.Context,
+) (*catalogcollector.CatalogSnapshot, error)
 
-// NowFunc returns the current time. Used only for the last-success gauge.
-// Inject a fake in tests.
+// NowFunc returns the current time. It is used to measure collection-cycle
+// duration and can be replaced by tests.
 type NowFunc func() time.Time
 
-// JitterFunc returns a non-negative random duration in [0, max). Inject a
-// deterministic function in tests.
+// JitterFunc returns a random duration in [0, max). Tests may inject a
+// deterministic implementation.
 type JitterFunc func(max time.Duration) time.Duration
 
-// BackoffConfig holds parameters for bounded exponential backoff with jitter.
+// BackoffConfig configures bounded exponential backoff with symmetric jitter.
 type BackoffConfig struct {
-	// InitialInterval is the first wait duration after a failure.
+	// InitialInterval is the base delay after the first failed cycle.
 	InitialInterval util.Duration `json:"initialInterval,omitempty"`
 
-	// MaxInterval caps the computed backoff duration.
+	// MaxInterval is the maximum actual retry delay, including jitter.
 	MaxInterval util.Duration `json:"maxInterval,omitempty"`
 
-	// Multiplier is applied to the current interval after each failure (≥ 1).
+	// Multiplier advances the base interval after each consecutive failure.
 	Multiplier float64 `json:"multiplier,omitempty"`
 
-	// RandomizationFactor applies symmetric jitter ±(factor × current) to the
-	// computed duration. Must be in [0, 1].
+	// RandomizationFactor applies symmetric jitter around the base interval.
+	// It must be within [0, 1].
 	RandomizationFactor float64 `json:"randomizationFactor,omitempty"`
 }
 
-// Validate returns an error if the BackoffConfig is not usable.
+// Validate verifies that the backoff configuration can safely drive the
+// polling loop.
 func (c *BackoffConfig) Validate() error {
-	if time.Duration(c.InitialInterval) <= 0 {
-		return fmt.Errorf("backoff.initialInterval must be positive, got %s", time.Duration(c.InitialInterval))
+	initial := time.Duration(c.InitialInterval)
+	maximum := time.Duration(c.MaxInterval)
+
+	if initial <= 0 {
+		return fmt.Errorf(
+			"backoff.initialInterval must be positive, got %s",
+			initial,
+		)
 	}
-	if time.Duration(c.MaxInterval) <= 0 {
-		return fmt.Errorf("backoff.maxInterval must be positive, got %s", time.Duration(c.MaxInterval))
+	if maximum <= 0 {
+		return fmt.Errorf(
+			"backoff.maxInterval must be positive, got %s",
+			maximum,
+		)
 	}
-	if c.InitialInterval > c.MaxInterval {
-		return fmt.Errorf("backoff.initialInterval (%s) must not exceed backoff.maxInterval (%s)",
-			time.Duration(c.InitialInterval), time.Duration(c.MaxInterval))
+	if initial > maximum {
+		return fmt.Errorf(
+			"backoff.initialInterval (%s) must not exceed "+
+				"backoff.maxInterval (%s)",
+			initial,
+			maximum,
+		)
 	}
-	if c.Multiplier < 1.0 {
-		return fmt.Errorf("backoff.multiplier must be >= 1.0, got %g", c.Multiplier)
+
+	if math.IsNaN(c.Multiplier) ||
+		math.IsInf(c.Multiplier, 0) ||
+		c.Multiplier < 1 {
+		return fmt.Errorf(
+			"backoff.multiplier must be finite and >= 1.0, got %g",
+			c.Multiplier,
+		)
 	}
-	if c.RandomizationFactor < 0 || c.RandomizationFactor > 1 {
-		return fmt.Errorf("backoff.randomizationFactor must be in [0, 1], got %g", c.RandomizationFactor)
+
+	if math.IsNaN(c.RandomizationFactor) ||
+		math.IsInf(c.RandomizationFactor, 0) ||
+		c.RandomizationFactor < 0 ||
+		c.RandomizationFactor > 1 {
+		return fmt.Errorf(
+			"backoff.randomizationFactor must be finite and in [0, 1], got %g",
+			c.RandomizationFactor,
+		)
 	}
+
 	return nil
 }
 
-// DefaultBackoffConfig returns a BackoffConfig with safe default values.
+// DefaultBackoffConfig returns the default bounded-backoff configuration.
 func DefaultBackoffConfig() BackoffConfig {
 	return BackoffConfig{
-		InitialInterval:     util.Duration(1 * time.Second),
+		InitialInterval:     util.Duration(time.Second),
 		MaxInterval:         util.Duration(5 * time.Minute),
-		Multiplier:          2.0,
+		Multiplier:          2,
 		RandomizationFactor: 0.5,
 	}
 }
 
 // Helper drives a periodic complete-snapshot polling loop.
 //
-// The first collection runs immediately. After a fully successful cycle
-// (collect + downstream consume both succeed) the helper waits pollInterval.
-// On any failure it waits the current backoff duration and advances the
-// exponential multiplier. Backoff resets only after a fully successful cycle.
+// The first cycle starts immediately. After collection and downstream
+// consumption both succeed, the helper resets backoff and waits pollInterval.
+// Any collection or downstream failure advances backoff.
 //
-// Collections never overlap. Context cancellation interrupts any in-flight
-// HTTP call (via the passed ctx) and any inter-cycle wait.
+// Collection cycles never overlap. Context cancellation interrupts collection,
+// downstream processing when supported by the consumer, and inter-cycle waits.
 type Helper struct {
 	id           string
 	pollInterval time.Duration
@@ -95,18 +127,19 @@ type Helper struct {
 	now          NowFunc
 	jitter       JitterFunc
 
-	// OnSuccess is called after each fully successful cycle (collect + consume).
-	// Use it to record metrics. May be nil.
+	// OnSuccess is called after collection and downstream consumption both
+	// complete successfully.
 	OnSuccess func(elapsed time.Duration)
-	// OnFailure is called after each failed cycle (collect or consume error).
-	// Use it to record metrics. May be nil.
+
+	// OnFailure is called after collection or downstream consumption fails,
+	// including cancellation of an in-progress cycle.
 	OnFailure func(elapsed time.Duration, err error)
 }
 
 // NewHelper constructs a polling helper.
 //
-// now and jitter may be nil; production defaults (time.Now and a rand-based
-// jitter) are used in that case.
+// now and jitter may be nil. Production clock and random-jitter implementations
+// are used when they are not supplied.
 func NewHelper(
 	id string,
 	pollInterval time.Duration,
@@ -126,6 +159,7 @@ func NewHelper(
 			return time.Duration(rand.Int64N(int64(max)))
 		}
 	}
+
 	return &Helper{
 		id:           id,
 		pollInterval: pollInterval,
@@ -136,102 +170,236 @@ func NewHelper(
 	}
 }
 
-// Run executes the polling loop until ctx is cancelled.
+// Run executes polling cycles until the context is cancelled or invalid helper
+// configuration is detected.
 //
-// On each iteration, collect is called. If both collect and next.Consume
-// succeed, the helper waits pollInterval before the next attempt and resets
-// backoff. On any failure it waits the current backoff duration (with jitter)
-// and multiplies the backoff for the next failure, up to MaxInterval.
-//
-// Run returns ctx.Err() when the context is cancelled.
+// Backoff resets only after both collection and downstream consumption succeed.
 func (h *Helper) Run(
 	ctx context.Context,
 	collect CollectFunc,
 	next catalogcollector.Consumer,
 ) error {
-	current := time.Duration(h.backoff.InitialInterval)
+	if err := h.validate(collect, next); err != nil {
+		return err
+	}
+
+	currentBackoff := time.Duration(h.backoff.InitialInterval)
 
 	for {
-		start := h.now()
+		startedAt := h.now()
 
-		snapshot, collectErr := collect(ctx)
-		if ctx.Err() != nil {
-			return ctx.Err()
+		snapshot, err := collect(ctx)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			h.notifyFailure(h.elapsedSince(startedAt), ctxErr)
+			return ctxErr
 		}
-
-		if collectErr != nil {
-			elapsed := h.now().Sub(start)
-			h.log.WithError(collectErr).Error("collection failed; applying backoff")
-			if h.OnFailure != nil {
-				h.OnFailure(elapsed, collectErr)
+		if err != nil {
+			currentBackoff = h.handleRetryableFailure(
+				ctx,
+				startedAt,
+				currentBackoff,
+				err,
+				"collection failed; applying backoff",
+			)
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
-			sleep := h.withJitter(current)
-			current = h.advance(current)
-			if !h.wait(ctx, sleep) {
+			continue
+		}
+		if snapshot == nil {
+			err = fmt.Errorf(
+				"polling source %q returned a nil snapshot without an error",
+				h.id,
+			)
+			currentBackoff = h.handleRetryableFailure(
+				ctx,
+				startedAt,
+				currentBackoff,
+				err,
+				"collection failed; applying backoff",
+			)
+			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			continue
 		}
 
-		consumeErr := next.Consume(ctx, snapshot)
-		if ctx.Err() != nil {
-			return ctx.Err()
+		err = next.Consume(ctx, snapshot)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			h.notifyFailure(h.elapsedSince(startedAt), ctxErr)
+			return ctxErr
 		}
-
-		elapsed := h.now().Sub(start)
-
-		if consumeErr != nil {
-			h.log.WithError(consumeErr).Error("downstream consume failed; applying backoff")
-			if h.OnFailure != nil {
-				h.OnFailure(elapsed, consumeErr)
-			}
-			sleep := h.withJitter(current)
-			current = h.advance(current)
-			if !h.wait(ctx, sleep) {
+		if err != nil {
+			currentBackoff = h.handleRetryableFailure(
+				ctx,
+				startedAt,
+				currentBackoff,
+				err,
+				"downstream consumption failed; applying backoff",
+			)
+			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			continue
 		}
 
-		// Fully successful cycle: reset backoff and wait the normal interval.
+		elapsed := h.elapsedSince(startedAt)
 		if h.OnSuccess != nil {
 			h.OnSuccess(elapsed)
 		}
-		current = time.Duration(h.backoff.InitialInterval)
+
+		currentBackoff = time.Duration(h.backoff.InitialInterval)
 		if !h.wait(ctx, h.pollInterval) {
 			return ctx.Err()
 		}
 	}
 }
 
-// withJitter applies symmetric jitter to d using RandomizationFactor.
-// The result is in [d*(1-rf), d*(1+rf)] and is always positive.
-func (h *Helper) withJitter(d time.Duration) time.Duration {
-	rf := h.backoff.RandomizationFactor
-	if rf == 0 {
-		return d
+func (h *Helper) validate(
+	collect CollectFunc,
+	next catalogcollector.Consumer,
+) error {
+	if h.pollInterval <= 0 {
+		return fmt.Errorf(
+			"polling source %q: poll interval must be positive, got %s",
+			h.id,
+			h.pollInterval,
+		)
 	}
-	delta := time.Duration(float64(d) * rf)
-	// Jitter in [0, 2*delta), mapped to [-delta, +delta).
-	jitter := h.jitter(2*delta+1) - delta
-	if result := d + jitter; result > 0 {
-		return result
+	if err := h.backoff.Validate(); err != nil {
+		return fmt.Errorf("polling source %q: %w", h.id, err)
 	}
-	return d
+	if h.log == nil {
+		return fmt.Errorf("polling source %q: logger must not be nil", h.id)
+	}
+	if collect == nil {
+		return fmt.Errorf(
+			"polling source %q: collection callback must not be nil",
+			h.id,
+		)
+	}
+	if next == nil {
+		return fmt.Errorf(
+			"polling source %q: downstream consumer must not be nil",
+			h.id,
+		)
+	}
+
+	return nil
 }
 
-// advance multiplies current by Multiplier and caps at MaxInterval.
-func (h *Helper) advance(current time.Duration) time.Duration {
-	next := time.Duration(float64(current) * h.backoff.Multiplier)
-	if next > time.Duration(h.backoff.MaxInterval) {
-		return time.Duration(h.backoff.MaxInterval)
+// handleRetryableFailure records and logs one failed cycle, waits for the
+// current jittered backoff, and returns the advanced base interval.
+//
+// If the context is cancelled during the wait, Run observes ctx.Err() and
+// exits rather than starting another cycle.
+func (h *Helper) handleRetryableFailure(
+	ctx context.Context,
+	startedAt time.Time,
+	currentBackoff time.Duration,
+	err error,
+	message string,
+) time.Duration {
+	elapsed := h.elapsedSince(startedAt)
+	h.notifyFailure(elapsed, err)
+
+	retryAfter := h.withJitter(currentBackoff)
+	h.log.WithError(err).
+		WithField("retry_after", retryAfter).
+		Error(message)
+
+	nextBackoff := h.advance(currentBackoff)
+	_ = h.wait(ctx, retryAfter)
+
+	return nextBackoff
+}
+
+func (h *Helper) notifyFailure(
+	elapsed time.Duration,
+	err error,
+) {
+	if h.OnFailure != nil {
+		h.OnFailure(elapsed, err)
 	}
+}
+
+func (h *Helper) elapsedSince(start time.Time) time.Duration {
+	elapsed := h.now().Sub(start)
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
+}
+
+// withJitter applies symmetric jitter while keeping the actual retry delay
+// positive and no greater than MaxInterval.
+func (h *Helper) withJitter(base time.Duration) time.Duration {
+	maximum := time.Duration(h.backoff.MaxInterval)
+	if base > maximum {
+		base = maximum
+	}
+
+	factor := h.backoff.RandomizationFactor
+	if factor == 0 {
+		return base
+	}
+
+	delta := time.Duration(float64(base) * factor)
+	if delta < 0 || delta > base {
+		delta = base
+	}
+
+	lower := base - delta
+	upper := base + delta
+
+	if upper < base || upper > maximum {
+		upper = maximum
+	}
+	if lower < time.Nanosecond {
+		lower = time.Nanosecond
+	}
+	if upper <= lower {
+		return lower
+	}
+
+	width := upper - lower
+	offset := h.jitter(width)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= width {
+		offset = width - 1
+	}
+
+	return lower + offset
+}
+
+// advance multiplies the current base interval and caps it at MaxInterval.
+func (h *Helper) advance(current time.Duration) time.Duration {
+	maximum := time.Duration(h.backoff.MaxInterval)
+	if current >= maximum {
+		return maximum
+	}
+
+	// Check before multiplication to avoid duration overflow.
+	if float64(current) >= float64(maximum)/h.backoff.Multiplier {
+		return maximum
+	}
+
+	next := time.Duration(float64(current) * h.backoff.Multiplier)
+	if next <= current || next > maximum {
+		return maximum
+	}
+
 	return next
 }
 
-// wait blocks for d or until ctx is cancelled. Returns false if cancelled.
-func (h *Helper) wait(ctx context.Context, d time.Duration) bool {
-	if d <= 0 {
+// wait blocks until the duration elapses or the context is cancelled.
+func (h *Helper) wait(
+	ctx context.Context,
+	duration time.Duration,
+) bool {
+	if duration <= 0 {
 		select {
 		case <-ctx.Done():
 			return false
@@ -239,10 +407,14 @@ func (h *Helper) wait(ctx context.Context, d time.Duration) bool {
 			return true
 		}
 	}
+
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
 	select {
 	case <-ctx.Done():
 		return false
-	case <-time.After(d):
+	case <-timer.C:
 		return true
 	}
 }

@@ -12,6 +12,20 @@ import (
 
 // fixtureDir is relative to the repo root (tests run from the package dir,
 // so we traverse up to find publisher/fixtures/model-registry/).
+//
+// The fixtures were captured from a real RHOAI 3.5.1 deployment (OCP 4.20.37)
+// using the Model Registry API v1alpha3 behind kube-rbac-proxy (bearer token
+// auth, router CA trust). Key observations:
+//   - ModelArtifact.State is absent from real API responses (unmarshalled as
+//     nil → treated as UNKNOWN → eligible per eligibleArtifactStates).
+//   - Registered models and model versions are server-side filtered via
+//     filterQuery=state='LIVE'; no state filter is applied to artifacts.
+//   - Reconciliation is idempotent: identical content produces the same
+//     revision hash and no writes are sent to Flightctl.
+//   - Auth failure (invalid bearer token) aborts the collection cycle without
+//     pruning existing Flightctl Catalog or CatalogItem resources.
+//   - Recovery is automatic: the poller retries with bounded exponential
+//     backoff; successful collection resets the backoff interval.
 const fixtureDir = "../../../../publisher/fixtures/model-registry"
 
 func readFixture[T any](t *testing.T, name string) T {

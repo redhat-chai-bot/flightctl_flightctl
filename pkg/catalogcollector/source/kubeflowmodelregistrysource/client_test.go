@@ -353,7 +353,7 @@ func TestSource_LiveVersionMultipleArtifacts_FailsCycle(t *testing.T) {
 // TestSource_UnknownStateArtifact_Eligible verifies that an artifact with
 // nil/absent state is treated as UNKNOWN and remains eligible.
 // This reflects the real RHOAI Compose environment where the state field is
-// absent from the artifact JSON (Open Question 9.4).
+// absent from the artifact JSON (validated against RHOAI 3.5.1, API v1alpha3).
 func TestSource_UnknownStateArtifact_Eligible(t *testing.T) {
 	nilState := mrapi.Artifact{
 		ModelArtifact: &mrapi.ModelArtifact{

@@ -3,7 +3,8 @@ package kubeflowmodelregistrysource
 import (
 	"fmt"
 	"strings"
-	"unicode"
+
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -11,143 +12,143 @@ const (
 	maxDNSLabelLength     = 63
 )
 
-// normalizeName maps a free-form RegisteredModel.name to a valid
-// RFC-1123 DNS subdomain (metadata.name).
+// normalizeName maps a free-form RegisteredModel name to a valid Kubernetes
+// DNS subdomain suitable for metadata.name.
 //
-// The algorithm (applied in order):
-//  1. Unicode simple case fold to lowercase; any rune outside [a-z0-9.-] is
-//     treated as a separator (non-ASCII → separator, not transliterated).
-//  2. Replace every maximal run of separator/disallowed characters with a
-//     single '-'.
-//  3. Split on '.', drop empty labels, strip leading/trailing '-' from each
-//     label; rejoin with '.'.
-//  4. Per-label length: truncate any label > 63 bytes to 63; strip trailing
-//     '-' if the truncation created one.
-//  5. Total length: truncate the joined result to 253 bytes; strip trailing
-//     '.' or '-' if truncation created one; re-apply step 4 to the final label.
-//  6. Empty result → error.
+// The original name remains unchanged in CatalogItem.spec.displayName.
 //
-// The original name is preserved verbatim in spec.displayName; this function
-// only produces the DNS-safe metadata.name.
+// Normalization rules:
+//
+//  1. ASCII uppercase letters are converted to lowercase.
+//  2. ASCII lowercase letters and digits are preserved.
+//  3. Original dots remain DNS-label boundaries.
+//  4. Every run of other characters, including non-ASCII characters, becomes
+//     one hyphen within its label. Non-ASCII text is never transliterated.
+//  5. Empty labels are removed and leading or trailing hyphens are stripped.
+//  6. Each label is limited to 63 bytes.
+//  7. The complete name is limited to 253 bytes.
+//  8. An empty result is rejected.
 func normalizeName(name string) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("name is empty")
 	}
 
-	// Step 1: lowercase + mark disallowed runes as separator.
-	// We use a rune buffer and a single pass.
-	var buf strings.Builder
-	buf.Grow(len(name))
+	var normalized strings.Builder
+	normalized.Grow(len(name))
+
+	separatorPending := false
 
 	for _, r := range name {
-		folded := unicode.ToLower(r)
-		if (folded >= 'a' && folded <= 'z') || (folded >= '0' && folded <= '9') {
-			buf.WriteRune(folded)
-		} else if folded == '.' {
-			buf.WriteByte('.')
-		} else {
-			// Everything else (including non-ASCII runes) is a separator.
-			buf.WriteByte('-')
+		switch {
+		case r == '.':
+			// A dot is an explicit label boundary. Do not carry a pending
+			// separator into the next label.
+			normalized.WriteByte('.')
+			separatorPending = false
+
+		case r >= 'A' && r <= 'Z':
+			writePendingSeparator(&normalized, &separatorPending)
+			normalized.WriteByte(byte(r + ('a' - 'A')))
+
+		case (r >= 'a' && r <= 'z') ||
+			(r >= '0' && r <= '9'):
+			writePendingSeparator(&normalized, &separatorPending)
+			normalized.WriteByte(byte(r))
+
+		default:
+			// Hyphens, underscores, whitespace, punctuation and every
+			// non-ASCII rune are separators. They are not transliterated.
+			if normalized.Len() > 0 {
+				separatorPending = true
+			}
 		}
 	}
-	s := buf.String()
 
-	// Step 2: collapse maximal runs of '-' into a single '-'.
-	// Also collapse runs that contain '.' together as '.'. We do a character-by-character pass:
-	// treat '-' as separator, '.' as dot, and collapse consecutive separators/dots into
-	// a single '-' (or '.' if a dot appears in the run) by keeping only transitions.
-	s = collapseRuns(s)
+	labels := strings.Split(normalized.String(), ".")
+	validLabels := make([]string, 0, len(labels))
 
-	// Step 3: split on '.', process labels, rejoin.
-	labels := strings.Split(s, ".")
-	var validLabels []string
 	for _, label := range labels {
 		label = strings.Trim(label, "-")
 		if label == "" {
 			continue
 		}
-		validLabels = append(validLabels, label)
+
+		label = truncateLabel(label)
+		if label != "" {
+			validLabels = append(validLabels, label)
+		}
 	}
+
 	if len(validLabels) == 0 {
-		return "", fmt.Errorf("name %q normalizes to empty (no alphanumeric content)", name)
+		return "", fmt.Errorf(
+			"name %q contains no ASCII letters or digits after normalization",
+			name,
+		)
 	}
 
-	// Step 4: per-label length cap.
-	for i, label := range validLabels {
-		validLabels[i] = truncateLabel(label)
-	}
-
-	// Step 5: total length cap.
 	result := strings.Join(validLabels, ".")
-	if len(result) > maxDNSSubdomainLength {
-		result = truncateSubdomain(result)
+	result = truncateSubdomain(result)
+
+	if result == "" {
+		return "", fmt.Errorf(
+			"name %q is empty after applying DNS-subdomain limits",
+			name,
+		)
 	}
 
-	// Step 6: final validation.
-	if result == "" {
-		return "", fmt.Errorf("name %q normalizes to empty", name)
+	if validationErrors := k8svalidation.IsDNS1123Subdomain(result); len(validationErrors) > 0 {
+		return "", fmt.Errorf(
+			"name %q normalized to invalid DNS subdomain %q: %s",
+			name,
+			result,
+			strings.Join(validationErrors, "; "),
+		)
 	}
+
 	return result, nil
 }
 
-// collapseRuns replaces every maximal run of '-' (separator) with a single '-'.
-// A '.' is kept as a '.' separator but if a run mixes '-' and '.' the whole run
-// becomes '-' (since '.' inside a label is a separator, not a label boundary).
-// Actually: we need to be careful. After step 1, the string contains only
-// [a-z0-9.-]. The '.' character in the original name has special meaning
-// (label boundary). Other separator chars (originally '-' or non-ASCII mapped
-// to '-') collapse. So we collapse runs of '-' and keep '.' as-is.
-func collapseRuns(s string) string {
-	var buf strings.Builder
-	buf.Grow(len(s))
-	inRun := false
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if ch == '-' {
-			if !inRun {
-				buf.WriteByte('-')
-				inRun = true
-			}
-		} else {
-			inRun = false
-			buf.WriteByte(ch)
-		}
+// writePendingSeparator emits one hyphen before the next alphanumeric
+// character when one or more separator characters were observed.
+//
+// A separator is not emitted at the beginning of the complete name or
+// immediately after an explicit dot boundary.
+func writePendingSeparator(
+	builder *strings.Builder,
+	pending *bool,
+) {
+	if !*pending {
+		return
 	}
-	return buf.String()
+
+	value := builder.String()
+	if value != "" &&
+		value[len(value)-1] != '.' &&
+		value[len(value)-1] != '-' {
+		builder.WriteByte('-')
+	}
+
+	*pending = false
 }
 
-// truncateLabel truncates a single DNS label to maxDNSLabelLength bytes,
-// stripping any trailing '-' created by the truncation.
+// truncateLabel limits one DNS label to 63 bytes and ensures that truncation
+// does not leave a trailing hyphen.
 func truncateLabel(label string) string {
-	if len(label) <= maxDNSLabelLength {
-		return label
+	if len(label) > maxDNSLabelLength {
+		label = label[:maxDNSLabelLength]
 	}
-	label = label[:maxDNSLabelLength]
-	label = strings.TrimRight(label, "-")
-	return label
+
+	return strings.TrimRight(label, "-")
 }
 
-// truncateSubdomain truncates the full subdomain to maxDNSSubdomainLength bytes,
-// strips any trailing '.' or '-', then re-applies the per-label cap to the
-// now-truncated final label.
-func truncateSubdomain(s string) string {
-	s = s[:maxDNSSubdomainLength]
-	s = strings.TrimRight(s, "-.")
-
-	// The final label may have been truncated mid-label; re-apply per-label cap.
-	dot := strings.LastIndexByte(s, '.')
-	if dot < 0 {
-		// Only one label.
-		s = truncateLabel(s)
-	} else {
-		prefix := s[:dot+1]
-		last := truncateLabel(s[dot+1:])
-		if last == "" {
-			// The last label became empty; drop the trailing dot.
-			s = strings.TrimRight(prefix, ".")
-		} else {
-			s = prefix + last
-		}
+// truncateSubdomain limits the complete DNS subdomain to 253 bytes and ensures
+// that truncation does not leave a trailing dot or hyphen.
+//
+// All output is ASCII, so byte truncation cannot split a UTF-8 sequence.
+func truncateSubdomain(value string) string {
+	if len(value) > maxDNSSubdomainLength {
+		value = value[:maxDNSSubdomainLength]
 	}
-	return s
+
+	return strings.TrimRight(value, ".-")
 }

@@ -423,8 +423,14 @@ func TestComputeRevision_Deterministic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r1 := computeRevision(catalogs, items)
-	r2 := computeRevision(catalogs, items)
+	r1, err := computeRevision(catalogs, items)
+	if err != nil {
+		t.Fatalf("computeRevision: %v", err)
+	}
+	r2, err := computeRevision(catalogs, items)
+	if err != nil {
+		t.Fatalf("computeRevision: %v", err)
+	}
 	if r1 != r2 {
 		t.Errorf("computeRevision is not deterministic: %q vs %q", r1, r2)
 	}
@@ -440,8 +446,14 @@ func TestComputeRevision_ChangesWithContent(t *testing.T) {
 	c1, i1, _ := toSnapshot("my-catalog", m1)
 	c2, i2, _ := toSnapshot("my-catalog", m2)
 
-	r1 := computeRevision(c1, i1)
-	r2 := computeRevision(c2, i2)
+	r1, err := computeRevision(c1, i1)
+	if err != nil {
+		t.Fatalf("computeRevision: %v", err)
+	}
+	r2, err := computeRevision(c2, i2)
+	if err != nil {
+		t.Fatalf("computeRevision: %v", err)
+	}
 	if r1 == r2 {
 		t.Error("expected different revisions for different content, got equal")
 	}
