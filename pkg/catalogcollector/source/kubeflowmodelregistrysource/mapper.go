@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	gosemver "github.com/coreos/go-semver/semver"
 	mrapi "github.com/kubeflow/hub/pkg/openapi"
 
 	apiv1alpha1 "github.com/flightctl/flightctl/api/core/v1alpha1"
@@ -244,9 +245,12 @@ func toVersions(
 	}
 
 	// Canonicalize version order so snapshot revisions do not depend on API
-	// pagination or insertion order.
+	// pagination or insertion order. Parse as semver (already validated above)
+	// so that "1.9.0" sorts before "1.10.0".
 	sort.Slice(versions, func(i, j int) bool {
-		return versions[i].Version < versions[j].Version
+		vi := gosemver.New(string(versions[i].Version))
+		vj := gosemver.New(string(versions[j].Version))
+		return vi.LessThan(*vj)
 	})
 
 	return versions, nil

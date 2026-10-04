@@ -2,11 +2,28 @@ package kubeflowmodelregistrysource
 
 import (
 	"context"
+	"fmt"
 
 	mrapi "github.com/kubeflow/hub/pkg/openapi"
 )
 
 const liveStateFilter = "state='LIVE'"
+
+// httpError wraps an upstream error with the HTTP status code returned by the
+// Model Registry SDK. This lets wrapHTTPError include the status code in
+// sanitized log messages without changing the registryClient interface.
+type httpError struct {
+	statusCode int
+	err        error
+}
+
+func (e *httpError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.statusCode, e.err.Error())
+}
+
+func (e *httpError) Unwrap() error {
+	return e.err
+}
 
 // registryClient abstracts the Model Registry v1alpha3 operations required by
 // the source.
@@ -71,7 +88,10 @@ func (c *openapiClient) ListRegisteredModels(
 		request = request.NextPageToken(nextPageToken)
 	}
 
-	list, _, err := request.Execute()
+	list, resp, err := request.Execute()
+	if err != nil && resp != nil {
+		return list, &httpError{statusCode: resp.StatusCode, err: err}
+	}
 	return list, err
 }
 
@@ -90,7 +110,10 @@ func (c *openapiClient) ListModelVersions(
 		request = request.NextPageToken(nextPageToken)
 	}
 
-	list, _, err := request.Execute()
+	list, resp, err := request.Execute()
+	if err != nil && resp != nil {
+		return list, &httpError{statusCode: resp.StatusCode, err: err}
+	}
 	return list, err
 }
 
@@ -111,6 +134,9 @@ func (c *openapiClient) ListModelArtifacts(
 		request = request.NextPageToken(nextPageToken)
 	}
 
-	list, _, err := request.Execute()
+	list, resp, err := request.Execute()
+	if err != nil && resp != nil {
+		return list, &httpError{statusCode: resp.StatusCode, err: err}
+	}
 	return list, err
 }

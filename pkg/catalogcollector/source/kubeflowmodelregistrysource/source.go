@@ -457,6 +457,16 @@ func (s *source) wrapHTTPError(
 		return fmt.Errorf("%s: %w", operation, err)
 	}
 
+	var httpErr *httpError
+	if errors.As(err, &httpErr) {
+		return fmt.Errorf(
+			"%s: Model Registry HTTP %d: "+
+				"check endpoint connectivity, credentials, and RBAC",
+			operation,
+			httpErr.statusCode,
+		)
+	}
+
 	var openAPIErr *mrapi.GenericOpenAPIError
 	if errors.As(err, &openAPIErr) {
 		return fmt.Errorf(

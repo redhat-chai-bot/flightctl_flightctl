@@ -3,6 +3,7 @@ package kubeflowmodelregistrysource
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -316,5 +317,55 @@ func TestWrapHTTPError_NoCredentialLeak(t *testing.T) {
 	msg := wrapped.Error()
 	if len(msg) == 0 {
 		t.Error("wrapped error message is empty")
+	}
+}
+
+func TestWrapHTTPError_PreservesHTTPStatusCode(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus string
+	}{
+		{
+			name:       "When error wraps HTTP 403 it should include status code in message",
+			err:        &httpError{statusCode: 403, err: errors.New("forbidden")},
+			wantStatus: "HTTP 403",
+		},
+		{
+			name:       "When error wraps HTTP 404 it should include status code in message",
+			err:        &httpError{statusCode: 404, err: errors.New("not found")},
+			wantStatus: "HTTP 404",
+		},
+		{
+			name:       "When error wraps HTTP 500 it should include status code in message",
+			err:        &httpError{statusCode: 500, err: errors.New("internal server error")},
+			wantStatus: "HTTP 500",
+		},
+		{
+			name:       "When error wraps HTTP 429 it should include status code in message",
+			err:        &httpError{statusCode: 429, err: errors.New("too many requests")},
+			wantStatus: "HTTP 429",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &source{log: testLogger()}
+			wrapped := s.wrapHTTPError("listing models", tc.err)
+			if wrapped == nil {
+				t.Fatal("expected non-nil wrapped error")
+			}
+			msg := wrapped.Error()
+			if !strings.Contains(msg, tc.wantStatus) {
+				t.Errorf("wrapped error %q does not contain %q", msg, tc.wantStatus)
+			}
+			// Must not contain the original error body.
+			var httpErr *httpError
+			if errors.As(tc.err, &httpErr) {
+				if strings.Contains(msg, httpErr.err.Error()) {
+					t.Errorf("wrapped error %q leaks original error body %q", msg, httpErr.err.Error())
+				}
+			}
+		})
 	}
 }

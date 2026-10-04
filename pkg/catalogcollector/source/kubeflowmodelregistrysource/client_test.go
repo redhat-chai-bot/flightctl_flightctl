@@ -3,6 +3,7 @@ package kubeflowmodelregistrysource
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -228,6 +229,77 @@ func TestClient_ServerError_FailsCycle(t *testing.T) {
 	_, err := c.ListRegisteredModels(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error from 500 response, got nil")
+	}
+}
+
+// TestClient_HTTPStatusCode_Preserved verifies that when the Model Registry
+// returns a non-2xx response, the HTTP status code is preserved via httpError
+// for each list method.
+func TestClient_HTTPStatusCode_Preserved(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusCode int
+		listFunc   func(c *openapiClient) error
+	}{
+		{
+			name:       "When ListRegisteredModels gets 403 it should preserve status code",
+			statusCode: http.StatusForbidden,
+			listFunc: func(c *openapiClient) error {
+				_, err := c.ListRegisteredModels(context.Background(), "")
+				return err
+			},
+		},
+		{
+			name:       "When ListModelVersions gets 404 it should preserve status code",
+			statusCode: http.StatusNotFound,
+			listFunc: func(c *openapiClient) error {
+				_, err := c.ListModelVersions(context.Background(), "1", "")
+				return err
+			},
+		},
+		{
+			name:       "When ListModelArtifacts gets 429 it should preserve status code",
+			statusCode: http.StatusTooManyRequests,
+			listFunc: func(c *openapiClient) error {
+				_, err := c.ListModelArtifacts(context.Background(), "10", "")
+				return err
+			},
+		},
+		{
+			name:       "When ListRegisteredModels gets 500 it should preserve status code",
+			statusCode: http.StatusInternalServerError,
+			listFunc: func(c *openapiClient) error {
+				_, err := c.ListRegisteredModels(context.Background(), "")
+				return err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "error", tc.statusCode)
+			}))
+			defer srv.Close()
+
+			c, err := newOpenapiClient(srv.URL, "10")
+			if err != nil {
+				t.Fatalf("newOpenapiClient: %v", err)
+			}
+
+			err = tc.listFunc(c)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+
+			var httpErr *httpError
+			if !errors.As(err, &httpErr) {
+				t.Fatalf("expected *httpError, got %T: %v", err, err)
+			}
+			if httpErr.statusCode != tc.statusCode {
+				t.Errorf("status code = %d, want %d", httpErr.statusCode, tc.statusCode)
+			}
+		})
 	}
 }
 

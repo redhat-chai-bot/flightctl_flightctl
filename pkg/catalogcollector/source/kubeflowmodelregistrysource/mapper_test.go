@@ -412,6 +412,65 @@ func TestToSnapshot_NoEligibleVersions(t *testing.T) {
 	}
 }
 
+// TestToVersions_SemVerOrdering verifies that versions are sorted by semantic
+// versioning rather than lexicographic ordering. Without semver-aware sorting,
+// "1.10.0" would sort before "1.9.0".
+func TestToVersions_SemVerOrdering(t *testing.T) {
+	model := collectedModel{
+		model: makeModel("1", "my-model"),
+		versions: []collectedVersion{
+			{version: makeVersion("5", "1.10.0"), repository: goodRepo, digest: goodDigest},
+			{version: makeVersion("2", "1.2.0"), repository: goodRepo, digest: goodDigest},
+			{version: makeVersion("4", "1.9.0"), repository: goodRepo, digest: goodDigest},
+			{version: makeVersion("3", "2.0.0"), repository: goodRepo, digest: goodDigest},
+			{version: makeVersion("1", "1.0.0"), repository: goodRepo, digest: goodDigest},
+		},
+	}
+
+	versions, err := toVersions(model)
+	if err != nil {
+		t.Fatalf("toVersions() error: %v", err)
+	}
+
+	want := []string{"1.0.0", "1.2.0", "1.9.0", "1.10.0", "2.0.0"}
+	if len(versions) != len(want) {
+		t.Fatalf("expected %d versions, got %d", len(want), len(versions))
+	}
+	for i, v := range versions {
+		if string(v.Version) != want[i] {
+			t.Errorf("version[%d] = %q, want %q", i, v.Version, want[i])
+		}
+	}
+}
+
+// TestToVersions_SemVerPreRelease verifies that pre-release versions sort
+// before their release counterpart per the SemVer specification.
+func TestToVersions_SemVerPreRelease(t *testing.T) {
+	model := collectedModel{
+		model: makeModel("1", "my-model"),
+		versions: []collectedVersion{
+			{version: makeVersion("2", "1.0.0"), repository: goodRepo, digest: goodDigest},
+			{version: makeVersion("1", "1.0.0-alpha.1"), repository: goodRepo, digest: goodDigest},
+			{version: makeVersion("3", "1.0.0-beta.1"), repository: goodRepo, digest: goodDigest},
+		},
+	}
+
+	versions, err := toVersions(model)
+	if err != nil {
+		t.Fatalf("toVersions() error: %v", err)
+	}
+
+	want := []string{"1.0.0-alpha.1", "1.0.0-beta.1", "1.0.0"}
+	if len(versions) != len(want) {
+		t.Fatalf("expected %d versions, got %d", len(want), len(versions))
+	}
+	for i, v := range versions {
+		if string(v.Version) != want[i] {
+			t.Errorf("version[%d] = %q, want %q", i, v.Version, want[i])
+		}
+	}
+}
+
 // --- computeRevision tests -------------------------------------------------
 
 func TestComputeRevision_Deterministic(t *testing.T) {
