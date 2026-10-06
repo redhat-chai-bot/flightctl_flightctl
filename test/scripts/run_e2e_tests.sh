@@ -8,6 +8,8 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "${SCRIPT_DIR}"/functions
 source "${SCRIPT_DIR}"/detect_container_runtime.sh
 
+export E2E_SESSION_ID="${E2E_SESSION_ID:-$(cat /proc/sys/kernel/random/uuid)}"
+
 REPORTS=${1}
 GO_E2E_DIRS=("${@:2}")
 GINKGO_FOCUS=${GINKGO_FOCUS:-""}

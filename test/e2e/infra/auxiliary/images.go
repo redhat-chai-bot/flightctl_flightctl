@@ -229,6 +229,9 @@ func (s *Services) uploadBundle(ctx context.Context, bundlePath string) error {
 // registry failures and keeps each skopeo invocation bounded by perCopyTimeout
 // so a hung copy can't block the uploadConcurrency semaphore indefinitely.
 func (s *Services) copyImageFromBundle(ctx context.Context, bundlePath, ref string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	path := ref
 	if idx := strings.Index(ref, "/"); idx != -1 {
 		path = ref[idx+1:]
@@ -238,14 +241,20 @@ func (s *Services) copyImageFromBundle(ctx context.Context, bundlePath, ref stri
 
 	var lastErr error
 	for attempt := 1; attempt <= bundleCopyRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		copyCtx, cancel := context.WithTimeout(ctx, perCopyTimeout)
 		copyCmd := exec.CommandContext(copyCtx, "skopeo", "copy", "--dest-tls-verify=false", src, dst)
 		output, err := copyCmd.CombinedOutput()
-		timedOut := copyCtx.Err() != nil
+		copyErr := copyCtx.Err()
 		cancel()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
-		if timedOut {
-			lastErr = fmt.Errorf("skopeo copy for %s did not complete within %s: %w", ref, perCopyTimeout, copyCtx.Err())
+		if copyErr != nil {
+			lastErr = fmt.Errorf("skopeo copy for %s did not complete within %s: %w", ref, perCopyTimeout, copyErr)
 		} else if err != nil {
 			lastErr = fmt.Errorf("skopeo copy failed for %s: %w, output: %s", ref, err, string(output))
 		} else {
@@ -256,7 +265,7 @@ func (s *Services) copyImageFromBundle(ctx context.Context, bundlePath, ref stri
 			logrus.Warnf("Retrying bundle image upload for %s (attempt %d/%d): %v", ref, attempt, bundleCopyRetries, lastErr)
 			select {
 			case <-ctx.Done():
-				return lastErr
+				return ctx.Err()
 			case <-time.After(bundleCopyRetryWait):
 			}
 		}
@@ -298,8 +307,8 @@ type manifestEntry struct {
 	RepoTags []string `json:"RepoTags"`
 }
 
-// ResolveAgentDeviceImageTag returns the exact "base" image tag (e.g.
-// "base-cs10-bootc-v1.3.0-main-332-g250be75c") that was actually bundled for a container-backed
+// ResolveAgentDeviceImage returns the full image reference with the exact "base" tag (e.g.
+// "quay.io/flightctl/flightctl-device:base-cs10-bootc-v1.3.0-main-332-g250be75c") bundled for a container-backed
 // device to pull, by reading it back out of the same agent-images-bundle-*.tar UploadImages just
 // pushed from (see uploadBundle/copyImageFromBundle above).
 //
@@ -315,7 +324,7 @@ type manifestEntry struct {
 // osIDHint, if non-empty, is used to pick the right bundle file when more than one exists on disk
 // (e.g. a local dev machine that built both cs9-bootc and cs10-bootc); CI only ever stages the one
 // bundle matching the current shard's os_id input, so it's optional there.
-func ResolveAgentDeviceImageTag(osIDHint string) (string, error) {
+func ResolveAgentDeviceImage(osIDHint string) (string, error) {
 	if strings.ContainsAny(osIDHint, `/\*?[]`) {
 		return "", fmt.Errorf("invalid os ID hint %q: must not contain path separators or glob metacharacters", osIDHint)
 	}
@@ -348,7 +357,7 @@ func ResolveAgentDeviceImageTag(osIDHint string) (string, error) {
 		}
 		tag := ref[idx+1:]
 		if strings.HasPrefix(tag, "base-") {
-			return tag, nil
+			return ref, nil
 		}
 	}
 	return "", fmt.Errorf("no base-tagged image found in bundle %s (refs: %v)", matches[0], refs)
