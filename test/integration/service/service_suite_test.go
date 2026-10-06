@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -63,17 +64,32 @@ func TestServiceSuite(t *testing.T) {
 	RunSpecs(t, "Service Integration Suite")
 }
 
-var _ = BeforeSuite(func() {
+var _ = SynchronizedBeforeSuite(func(ctx context.Context) []byte {
+	// Proc 1 only: start shared infrastructure and single Redis container.
+	Expect(integrationstack.EnsureRunning(ctx)).To(Succeed())
+	host, port, password, cleanup, err := testdb.CreateTestRedis(ctx, flightlog.InitLogs())
+	Expect(err).ToNot(HaveOccurred())
+	redisCleanup = cleanup
+	info, err := json.Marshal(map[string]interface{}{
+		"host": host, "port": port, "password": string(password),
+	})
+	Expect(err).ToNot(HaveOccurred())
+	return info
+}, func(ctx context.Context, data []byte) {
+	// All procs: deserialize shared Redis connection and set up per-process state.
 	suiteCtx = testutil.InitSuiteTracerForGinkgo("Service Integration Suite")
 	Expect(integrationstack.EnsureRunning(suiteCtx)).To(Succeed())
-
-	var err error
-	redisHost, redisPort, redisPassword, redisCleanup, err = testdb.CreateTestRedis(
-		suiteCtx, flightlog.InitLogs())
-	Expect(err).NotTo(HaveOccurred())
+	var info map[string]interface{}
+	Expect(json.Unmarshal(data, &info)).To(Succeed())
+	redisHost = info["host"].(string)
+	redisPort = uint(info["port"].(float64))
+	redisPassword = domain.SecureString(info["password"].(string))
 })
 
-var _ = AfterSuite(func() {
+var _ = SynchronizedAfterSuite(func() {
+	// All procs: no per-process cleanup needed (Redis is shared).
+}, func() {
+	// Proc 1 only: tear down the shared Redis container.
 	if redisCleanup != nil {
 		redisCleanup()
 	}

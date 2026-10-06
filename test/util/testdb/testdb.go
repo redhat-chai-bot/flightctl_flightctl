@@ -37,7 +37,9 @@ func CreateTestRedis(ctx context.Context, log *logrus.Logger) (host string, port
 		Image:        redisImage,
 		ExposedPorts: []string{"6379/tcp"},
 		Cmd:          []string{"redis-server", "--requirepass", string(password)},
-		WaitingFor:   wait.ForListeningPort("6379/tcp").WithStartupTimeout(60 * time.Second),
+		WaitingFor: wait.ForExec([]string{"redis-cli", "-a", string(password), "PING"}).
+			WithStartupTimeout(60 * time.Second).
+			WithPollInterval(500 * time.Millisecond),
 	}
 
 	c, err := containers.GenericStart(ctx, req, false,

@@ -2,6 +2,7 @@ package vmrender_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -42,42 +43,56 @@ func TestVmRender(t *testing.T) {
 	RunSpecs(t, "VmRender Suite")
 }
 
-// SynchronizedBeforeSuite ensures the expensive binary extraction runs only
-// once (on proc 1). The resulting path is broadcast as []byte to all procs,
-// which each initialise their own vmConverter, Redis connection, and tracer.
+// SynchronizedBeforeSuite ensures the expensive binary extraction and Redis
+// container startup run only once (on proc 1). The resulting paths and
+// connection info are broadcast as JSON to all procs, which each initialise
+// their own vmConverter, Redis connection vars, and tracer.
 var _ = SynchronizedBeforeSuite(
-	// Proc 1 only: extract the vm-to-quadlet binary from a container.
+	// Proc 1 only: extract binary and start a single shared Redis container.
 	func(ctx context.Context) []byte {
 		Expect(integrationstack.EnsureRunning(ctx)).To(Succeed())
 		binaryPath, cleanup, err := extractVmToQuadletBinary(ctx)
 		Expect(err).ToNot(HaveOccurred(), "failed to extract vm-to-quadlet binary")
 		vmBinaryCleanup = cleanup
-		return []byte(binaryPath)
+
+		host, port, password, rCleanup, err := testdb.CreateTestRedis(ctx, flightlog.InitLogs())
+		Expect(err).ToNot(HaveOccurred())
+		redisCleanup = rCleanup
+
+		info, err := json.Marshal(map[string]interface{}{
+			"binaryPath": binaryPath,
+			"host":       host, "port": port, "password": string(password),
+		})
+		Expect(err).ToNot(HaveOccurred())
+		return info
 	},
-	// All procs: receive the shared binary path; set up per-process state.
-	func(ctx context.Context, binaryPathBytes []byte) {
+	// All procs: receive shared binary path and Redis connection; set up per-process state.
+	func(ctx context.Context, data []byte) {
 		suiteCtx = testutil.InitSuiteTracerForGinkgo("VmRender Suite")
-		Expect(integrationstack.EnsureRunning(ctx)).To(Succeed())
+		Expect(integrationstack.EnsureRunning(suiteCtx)).To(Succeed())
 
-		var err error
-		redisHost, redisPort, redisPassword, redisCleanup, err = testdb.CreateTestRedis(
-			suiteCtx, flightlog.InitLogs())
-		Expect(err).NotTo(HaveOccurred())
+		var info map[string]interface{}
+		Expect(json.Unmarshal(data, &info)).To(Succeed())
+		redisHost = info["host"].(string)
+		redisPort = uint(info["port"].(float64))
+		redisPassword = domain.SecureString(info["password"].(string))
 
-		vmBinaryPath = string(binaryPathBytes)
+		vmBinaryPath = info["binaryPath"].(string)
 		vmConverter = tasks.NewVmConverter(vmBinaryPath, tasks.DefaultVmRenderOptions())
 	},
 )
 
 // SynchronizedAfterSuite mirrors the above: per-process cleanup first, then
-// proc-1 teardown (binary container + temp dir) last.
+// proc-1 teardown (Redis container + binary temp dir) last.
 var _ = SynchronizedAfterSuite(
 	func() {
+		// All procs: no per-process cleanup needed (Redis is shared).
+	},
+	func() {
+		// Proc 1 only: tear down shared Redis container and binary temp dir.
 		if redisCleanup != nil {
 			redisCleanup()
 		}
-	},
-	func() {
 		if vmBinaryCleanup != nil {
 			vmBinaryCleanup()
 		}
