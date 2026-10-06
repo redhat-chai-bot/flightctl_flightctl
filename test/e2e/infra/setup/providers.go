@@ -117,11 +117,17 @@ func newK8sProviders(config *infra.EnvironmentConfig) (*infra.Providers, error) 
 }
 
 func newQuadletProviders(config *infra.EnvironmentConfig) (*infra.Providers, error) {
-	configDir := config.GetConfigDir()
-	secretDir := filepath.Join(configDir, "secrets") //nolint:gosec // G101: path to secret files dir, not a credential
+	configDir := config.ConfigDir
+	secretDir := ""
+	if configDir != "" {
+		secretDir = filepath.Join(configDir, "secrets")
+	}
 	useSudo := config.UseSudo
-	infraP := quadlet.NewInfraProvider(configDir, secretDir, useSudo)
-	lifecycleP := quadlet.NewServiceLifecycleProvider(infraP, useSudo)
+	infraP, err := quadlet.NewInfraProvider(configDir, secretDir, useSudo)
+	if err != nil {
+		return nil, fmt.Errorf("quadlet infra provider: %w", err)
+	}
+	lifecycleP := quadlet.NewServiceLifecycleProvider(infraP)
 	rbacP := quadlet.NewPAMRBACProvider(useSudo)
 	secretsP := quadlet.NewSecretsProvider(infraP)
 	tpmP := quadlet.NewTPMProvider(infraP, lifecycleP)

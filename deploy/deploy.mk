@@ -14,9 +14,9 @@ endif
 cluster: bin/e2e-certs/ca.pem
 	PATH="$(ROOT_DIR)/bin:$$PATH" test/scripts/install_kind.sh
 	@if [ "$$(id -u)" -eq 0 ]; then \
-		PATH="$(ROOT_DIR)/bin:$$PATH" kind get clusters | grep kind || PATH="$(ROOT_DIR)/bin:$$PATH" test/scripts/create_cluster.sh; \
+		PATH="$(ROOT_DIR)/bin:$$PATH" kind get clusters | grep -Fx "$${KIND_CLUSTER_NAME:-kind}" || PATH="$(ROOT_DIR)/bin:$$PATH" test/scripts/create_cluster.sh; \
 	else \
-		KIND_EXPERIMENTAL_PROVIDER=podman PATH="$(ROOT_DIR)/bin:$$PATH" kind get clusters | grep kind || PATH="$(ROOT_DIR)/bin:$$PATH" test/scripts/create_cluster.sh; \
+		KIND_EXPERIMENTAL_PROVIDER=podman PATH="$(ROOT_DIR)/bin:$$PATH" kind get clusters | grep -Fx "$${KIND_CLUSTER_NAME:-kind}" || PATH="$(ROOT_DIR)/bin:$$PATH" test/scripts/create_cluster.sh; \
 	fi
 
 clean-cluster:
@@ -70,7 +70,7 @@ ifndef SKIP_BUILD
 deploy-helm: flightctl-api-container flightctl-db-setup-container flightctl-worker-container flightctl-delta-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container flightctl-multiarch-cli-container flightctl-telemetry-gateway-container flightctl-remote-access-container
 endif
 deploy-helm:
-	kubectl config set-context kind-kind
+	kubectl config set-context "kind-$${KIND_CLUSTER_NAME:-kind}"
 	PATH="$(ROOT_DIR)/bin:$$PATH" test/scripts/install_helm.sh
 	@if [ "$$(id -u)" -eq 0 ]; then \
 		PATH="$(ROOT_DIR)/bin:$$PATH" test/scripts/deploy_with_helm.sh --db-size $(DB_SIZE); \
@@ -89,16 +89,16 @@ deploy-db-helm: cluster
 	fi
 
 deploy-db:
-	sudo -E deploy/scripts/deploy_quadlet_service.sh db
+	deploy/scripts/deploy_quadlet_service.sh db
 
 deploy-kv:
-	sudo -E deploy/scripts/deploy_quadlet_service.sh kv
+	deploy/scripts/deploy_quadlet_service.sh kv
 
 deploy-alertmanager:
-	sudo -E deploy/scripts/deploy_quadlet_service.sh alertmanager
+	deploy/scripts/deploy_quadlet_service.sh alertmanager
 
 deploy-alertmanager-proxy:
-	sudo -E deploy/scripts/deploy_quadlet_service.sh alertmanager-proxy
+	deploy/scripts/deploy_quadlet_service.sh alertmanager-proxy
 
 # Can set the SKIP_BUILD variable to skip the build step and use existing containers
 deploy-quadlets:
@@ -110,19 +110,19 @@ endif
 	OS="$(OS)" deploy/scripts/deploy_quadlets.sh
 
 kill-db:
-	sudo systemctl stop flightctl-db.service
+	bash -c 'source deploy/scripts/shared.sh; run_systemctl stop flightctl-db.service'
 
 kill-kv:
-	sudo systemctl stop flightctl-kv.service
+	bash -c 'source deploy/scripts/shared.sh; run_systemctl stop flightctl-kv.service'
 
 kill-alertmanager:
-	sudo systemctl stop flightctl-alertmanager.service
+	bash -c 'source deploy/scripts/shared.sh; run_systemctl stop flightctl-alertmanager.service'
 
 kill-alertmanager-proxy:
-	sudo systemctl stop flightctl-alertmanager-proxy.service
+	bash -c 'source deploy/scripts/shared.sh; run_systemctl stop flightctl-alertmanager-proxy.service'
 
 show-podman-secret:
-	sudo podman secret inspect $(SECRET_NAME) --showsecret | jq '.[] | .SecretData'
+	podman secret inspect $(SECRET_NAME) --showsecret | jq '.[] | .SecretData'
 
 # Can set the image tag to a specific version by using the PACKIT_CURRENT_VERSION variable
 # which builds the rpm with the specified version.
@@ -157,3 +157,7 @@ clean-services-container:
 	sudo podman rmi localhost/flightctl-services:latest || true
 
 .PHONY: deploy-db deploy _deploy cluster clean-cluster deploy-quadlets services-container run-services-container clean-services-container
+
+.PHONY: build-vm-image-builder
+build-vm-image-builder:
+	podman build -f hack/Containerfile.bootc-image-builder-rootless -t $${BIB_IMAGE:-localhost/flightctl-vm-image-builder:latest} .

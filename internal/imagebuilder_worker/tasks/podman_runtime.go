@@ -21,12 +21,16 @@ func isRootlessRuntime() bool {
 	}
 
 	uidMap, err := os.ReadFile("/proc/self/uid_map")
+	return rootlessFromUIDMap(uidMap, err)
+}
+
+func rootlessFromUIDMap(uidMap []byte, err error) bool {
 	if err != nil {
-		return false
+		return true
 	}
 	lines := strings.Split(strings.TrimSpace(string(uidMap)), "\n")
-	if len(lines) == 0 {
-		return false
+	if len(lines) != 1 {
+		return true
 	}
 	fields := strings.Fields(lines[0])
 	if len(fields) != 3 || fields[0] != "0" || fields[1] != "0" || fields[2] != "4294967295" {
@@ -83,7 +87,7 @@ func (w *podmanWorker) podmanEnvironment(overrides map[string]string) []string {
 // rootless mode that runtime is the build engine itself, with an isolated
 // per-job storage config. The rootful path uses the existing behavior.
 func (w *podmanWorker) podmanCommand(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := podmanCommandWithRuntime(ctx, w.Rootless, w.PodmanRuntimeDir, args...)
+	cmd := exec.CommandContext(ctx, "podman", args...)
 	if w.Rootless {
 		cmd.Env = w.podmanEnvironment(nil)
 	}

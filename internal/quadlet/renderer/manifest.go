@@ -78,7 +78,6 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		// Gateway service
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-gateway/flightctl-gateway.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-gateway.container"), Template: true, Mode: RegularFileMode},
 		{Action: ActionWriteFile, Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-gateway.container.d", "10-api-host-port.conf"), Content: fmt.Sprintf("[Container]\nPublishPort=%s:%d\n", config.GatewayHostPort, gatewayTLSContainerPort), Mode: RegularFileMode},
-		{Action: ActionWriteFile, Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-gateway.container.d", "20-upstream-checks.conf"), Content: gatewayDependencyChecks(config), Mode: RegularFileMode},
 		{Action: ActionCopyDir, Source: "deploy/podman/flightctl-gateway/flightctl-gateway-config/", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "flightctl-gateway/"), Template: false, Mode: RegularFileMode},
 
 		// ImageBuilder API service
@@ -218,6 +217,13 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		)
 	}
 
+	if !config.UserScope {
+		for _, service := range []string{"grafana", "prometheus"} {
+			file := "flightctl-" + service + ".container.d/98-system-state.conf"
+			actions = append(actions, InstallAction{Action: ActionCopyFile, Source: filepath.Join("deploy/podman", "flightctl-"+service, file), Destination: filepath.Join(config.QuadletFilesOutputDir, file), Template: true, Mode: RegularFileMode})
+		}
+	}
+
 	// Add KV config file based on image type (Valkey for EL10, Redis for EL9)
 	if strings.Contains(config.Kv.Image, "valkey") {
 		actions = append(actions, InstallAction{
@@ -253,28 +259,5 @@ func buildStorageHostDir(config *RendererConfig) string {
 	if configuredDir == systemPath(buildroot, "var", "tmp") {
 		return "/var/tmp"
 	}
-	return configuredDir
-}
-
-func gatewayDependencyChecks(config *RendererConfig) string {
-	services := []string{
-		"flightctl-api",
-		"flightctl-telemetry-gateway",
-		"flightctl-ui",
-		"flightctl-pam-issuer",
-		"flightctl-alertmanager-proxy",
-		"flightctl-cli-artifacts",
-	}
-
-	scopeArg := ""
-	if config.UserScope {
-		scopeArg = "--user "
-	}
-
-	var checks strings.Builder
-	checks.WriteString("[Service]\n")
-	for _, service := range services {
-		fmt.Fprintf(&checks, "ExecStartPre=/usr/bin/systemctl %sis-active %s\n", scopeArg, service)
-	}
-	return checks.String()
+	return unstageSystemPath(configuredDir, buildroot)
 }

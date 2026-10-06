@@ -2,14 +2,14 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 {kind|e2e-prepare|e2e-run|quadlets|clean}" >&2
+    echo "Usage: $0 {kind|e2e-prepare|e2e-run|quadlets}" >&2
     exit 2
 }
 
 [[ $# -eq 1 ]] || usage
 mode="$1"
 case "${mode}" in
-    kind|e2e-prepare|e2e-run|quadlets|clean) ;;
+    kind|e2e-prepare|e2e-run|quadlets) ;;
     *) usage ;;
 esac
 
@@ -36,7 +36,7 @@ check_user_systemd() {
 }
 
 check_user_systemd_kvm_access() {
-    if ! systemd-run --user --wait --quiet /usr/bin/test -r /dev/kvm -a -w /dev/kvm >/dev/null 2>&1; then
+    if ! systemd-run --user --wait --quiet sh -c '[ -r /dev/kvm ] && [ -w /dev/kvm ]' >/dev/null 2>&1; then
         fail "the user systemd manager cannot access /dev/kvm with its current group set. If this user was recently added to the KVM group, restart the user manager (for example, log out and back in or ask an administrator to terminate the lingering user session) before deploying Quadlets."
     fi
 }
@@ -52,16 +52,16 @@ check_podman() {
 
     local username
     username="$(id -un)"
-    if [[ ! -r /etc/subuid ]] || ! grep -qE "^(${username}|$(id -u)):[0-9]+:[1-9][0-9]*$" /etc/subuid; then
+    if [[ ! -r /etc/subuid ]] || ! awk -F: -v user="${username}" -v uid="$(id -u)" '($1 == user || $1 == uid) && $2 ~ /^[0-9]+$/ && $3 ~ /^[1-9][0-9]*$/ { found=1 } END { exit !found }' /etc/subuid; then
         fail "no subordinate UID range is configured for ${username} in /etc/subuid. Ask an administrator to configure subordinate IDs for rootless Podman."
     fi
-    if [[ ! -r /etc/subgid ]] || ! grep -qE "^(${username}|$(id -g)):[0-9]+:[1-9][0-9]*$" /etc/subgid; then
+    if [[ ! -r /etc/subgid ]] || ! awk -F: -v user="${username}" -v uid="$(id -u)" '($1 == user || $1 == uid) && $2 ~ /^[0-9]+$/ && $3 ~ /^[1-9][0-9]*$/ { found=1 } END { exit !found }' /etc/subgid; then
         fail "no subordinate GID range is configured for ${username} in /etc/subgid. Ask an administrator to configure subordinate IDs for rootless Podman."
     fi
-
 }
 
 check_crun() {
+    local mode="$1"
     local oci_runtime
     oci_runtime="$(podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || true)"
     [[ "${oci_runtime}" == "crun" ]] || fail "rootless ${mode} needs Podman's keep-groups option to preserve supplementary groups, which requires crun (current OCI runtime: ${oci_runtime:-unknown}). Configure Podman to use crun and retry."
@@ -74,7 +74,7 @@ check_cgroup_v2() {
 }
 
 check_kvm() {
-    local reason
+    local mode="$1" reason
     case "${mode}" in
         e2e-run)
             reason="E2E VM execution requires /dev/kvm"
@@ -148,7 +148,7 @@ check_e2e_artifact_ownership() {
 check_mock_artifact_ownership() {
     local repo_root mock_root path uid other_owner other_owner_uid
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-    mock_root="${RPM_MOCK_ROOT:-centos-stream+epel-next-9-x86_64}"
+    mock_root="${RPM_MOCK_ROOT:?Make must pass RPM_MOCK_ROOT}"
     path="${repo_root}/mock-${mock_root}"
     [[ -e "${path}" ]] || return 0
 
@@ -177,14 +177,17 @@ check_e2e_report_ownership() {
 }
 
 check_podman
-if [[ "${mode}" != "clean" && "${mode}" != "e2e-run" ]]; then
-    check_kvm
+if [[ "${mode}" == "kind" || "${mode}" == "quadlets" ]]; then
+    (check_kvm "${mode}") || echo "Warning: ImageExport needs KVM; API deployment can continue" >&2
+    (check_crun "${mode}") || echo "Warning: ImageExport supplementary groups require crun" >&2
+fi
+if [[ "${mode}" == "e2e-prepare" ]]; then
+    check_kvm "${mode}"
 fi
 
 case "${mode}" in
     kind)
         check_cgroup_v2
-        check_crun
         check_repo_bin_writable
         check_kind_cert_ownership
         check_user_systemd
@@ -194,7 +197,7 @@ case "${mode}" in
         fi
         ;;
     e2e-prepare)
-        check_crun
+        check_crun "${mode}"
         check_repo_bin_writable
         check_e2e_artifact_ownership
         check_mock_artifact_ownership
@@ -217,14 +220,12 @@ case "${mode}" in
         ;;
     quadlets)
         check_cgroup_v2
-        check_crun
         check_user_systemd
-        check_user_systemd_kvm_access
+        if [[ -c /dev/kvm ]]; then
+            (check_user_systemd_kvm_access) || echo "Warning: ImageExport needs user-manager KVM access" >&2
+        fi
         check_repo_bin_writable
         repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
         check_artifact_ownership "${repo_root}/bin/flightctl-standalone"
-        ;;
-    clean)
-        # Cleanup touches only the current user's Podman store and needs no KVM.
         ;;
 esac

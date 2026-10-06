@@ -16,7 +16,7 @@ if [[ "${EUID}" -ne 0 ]]; then
         fi
 
         CLI_RPM="$(find bin/brew-rpm -maxdepth 1 -type f -name 'flightctl-*.rpm' -print \
-            | grep -v -E '(agent|selinux|services|debug|\.src\.rpm)' | sort | head -n 1)"
+            | grep -v -E '(agent|selinux|services|debug|\.src\.rpm)' | sort | head -n 1 || true)"
         if [[ -z "${CLI_RPM}" ]]; then
             echo "ERROR: No flightctl CLI RPM found in Brew build ${BREW_BUILD_URL}" >&2
             echo "Available RPMs:" >&2
@@ -72,7 +72,7 @@ if [[ -n "${BREW_BUILD_URL:-}" ]]; then
     # Find the CLI RPM (pattern: flightctl-<version>-<release>.<dist>.<arch>.rpm)
     # Examples: flightctl-0.9.1-1.el9fc.x86_64.rpm, flightctl-0.9.0-1.fc41.x86_64.rpm
     # Exclude: flightctl-agent*, flightctl-selinux*, flightctl-services*, flightctl-debug*, *.src.rpm
-    CLI_RPM=$(ls flightctl-*.rpm 2>/dev/null | grep -v -E "(agent|selinux|services|debug|\.src\.rpm)" | head -1)
+    CLI_RPM=$(find . -maxdepth 1 -type f -name 'flightctl-*.rpm' -print | grep -v -E "(agent|selinux|services|debug|\.src\.rpm)" | sort | head -1 || true)
 
     if [[ -z "${CLI_RPM}" ]]; then
         echo "ERROR: No flightctl CLI RPM found in brew build ${BREW_BUILD_URL}"

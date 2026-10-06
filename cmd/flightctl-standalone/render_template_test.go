@@ -4,8 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/flightctl/flightctl/internal/quadlet/renderer"
 )
 
 func TestCompleteConfig_AAPClientID(t *testing.T) {
@@ -15,17 +13,13 @@ func TestCompleteConfig_AAPClientID(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	mockFile := filepath.Join(tmpDir, "aap-client-id")
+	mockFile := filepath.Join(tmpDir, "pki", "aap-client-id")
+	if err := os.MkdirAll(filepath.Dir(mockFile), 0700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(mockFile, []byte("file-client-id"), 0600); err != nil {
 		t.Fatalf("failed to write mock client id file: %v", err)
 	}
-
-	// Override DefaultAAPClientIDPath
-	origPath := renderer.DefaultAAPClientIDPath
-	renderer.DefaultAAPClientIDPath = mockFile
-	defer func() {
-		renderer.DefaultAAPClientIDPath = origPath
-	}()
 
 	tests := []struct {
 		name         string
@@ -33,7 +27,7 @@ func TestCompleteConfig_AAPClientID(t *testing.T) {
 		wantClientID string
 	}{
 		{
-			name: "uses file client id when config is empty",
+			name: "uses file client id next to the configured deployment",
 			inputData: map[string]interface{}{
 				"global": map[string]interface{}{
 					"baseDomain": "example.com",
@@ -63,7 +57,7 @@ func TestCompleteConfig_AAPClientID(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			opts := &RenderTemplateOptions{}
+			opts := &RenderTemplateOptions{Config: filepath.Join(tmpDir, "service-config.yaml")}
 			err := opts.completeConfig(tt.inputData)
 			if err != nil {
 				t.Fatalf("completeConfig failed: %v", err)

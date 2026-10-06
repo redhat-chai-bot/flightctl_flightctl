@@ -33,4 +33,4 @@ ExecStartPre=/usr/bin/env PATH=%D/flightctl/bin:/usr/bin:/bin flightctl-standalo
 ExecStartPost=/bin/bash -o pipefail -c 'if podman ps --filter name=flightctl-gateway --filter status=running --quiet | grep -q .; then podman exec flightctl-gateway nginx -s reload; else [ $$? -eq 1 ]; fi'
 
 [Install]
-WantedBy=default.target
+WantedBy=flightctl.target

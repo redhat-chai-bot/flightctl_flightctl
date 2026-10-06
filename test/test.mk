@@ -161,12 +161,12 @@ prepare-e2e-qcow-config: bin/.e2e-agent-injected
 # SSH keys and certs are still needed for git server authentication
 
 # Run the privilege/capability check before Make starts any preparation recipes.
-prepare-e2e-test: RPM_MOCK_ROOT=centos-stream+epel-next-9-x86_64
+prepare-e2e-test: RPM_MOCK_ROOT=$(RPM_MOCK_ROOT_DEFAULT)
 prepare-e2e-test:
 	RPM_MOCK_ROOT="$(RPM_MOCK_ROOT)" test/scripts/runtime_preflight.sh e2e-prepare
 	$(MAKE) _prepare-e2e-test RPM_MOCK_ROOT=$(RPM_MOCK_ROOT)
 
-_prepare-e2e-test: RPM_MOCK_ROOT=centos-stream+epel-next-9-x86_64
+_prepare-e2e-test: RPM_MOCK_ROOT=$(RPM_MOCK_ROOT_DEFAULT)
 _prepare-e2e-test: bin/.ssh/id_rsa.pub bin/e2e-certs/ca.pem build-e2e-containers prepare-e2e-qcow-config
 	./test/scripts/prepare_cli.sh
 
@@ -220,12 +220,12 @@ e2e-agent-images: $(E2E_AGENT_IMAGES_SENTINEL)
 in-cluster-e2e-test: prepare-e2e-test
 	$(MAKE) _e2e_test
 
-e2e-test: RPM_MOCK_ROOT=centos-stream+epel-next-9-x86_64
+e2e-test: RPM_MOCK_ROOT=$(RPM_MOCK_ROOT_DEFAULT)
 e2e-test:
 	BREW_BUILD_URL= RPM_MOCK_ROOT="$(RPM_MOCK_ROOT)" test/scripts/runtime_preflight.sh e2e-prepare
 	$(MAKE) _e2e-test-run RPM_MOCK_ROOT=$(RPM_MOCK_ROOT)
 
-_e2e-test-run: RPM_MOCK_ROOT=centos-stream+epel-next-9-x86_64
+_e2e-test-run: RPM_MOCK_ROOT=$(RPM_MOCK_ROOT_DEFAULT)
 _e2e-test-run: deploy prepare-e2e-qcow-config
 	$(MAKE) _e2e_test RPM_MOCK_ROOT=$(RPM_MOCK_ROOT)
 

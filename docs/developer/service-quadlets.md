@@ -267,7 +267,7 @@ The output directories depend on the effective user ID:
 | Temporary build and export data | `${XDG_CACHE_HOME:-$HOME/.cache}/flightctl/tmp/` | `/var/tmp/` |
 | `flightctl-standalone` helper | `${XDG_DATA_HOME:-$HOME/.local/share}/flightctl/bin/` | `/usr/bin/` |
 
-The Quadlet source files are shared between user and system managers. They use systemd path specifiers such as `%E`, `%D`, and `%S`, which resolve to the configuration, data, and state roots for the active manager. Rootless rendering adds Grafana and Prometheus drop-ins that reset and restate their mount lists so their persistent data lives below `${XDG_STATE_HOME:-$HOME/.local/state}/flightctl/`; system-scope units keep `/var/lib/grafana` and `/var/lib/prometheus`. Units that start independently use `WantedBy=default.target`, which is valid for user and system managers; core services remain attached to `flightctl.target`. The renderer installs a gateway port drop-in and an image-builder storage drop-in for either scope, rootless-only state and image-builder `/dev/kvm` access drop-ins, and user-manager wants links for the native service targets.
+The Quadlet source files are shared between user and system managers. They use systemd path specifiers such as `%E`, `%D`, and `%S`, which resolve to the configuration, data, and state roots for the active manager. Grafana and Prometheus use mutually exclusive state drop-ins: `99-rootless-state.conf` adds persistent data below `${XDG_STATE_HOME:-$HOME/.local/state}/flightctl/`, while `98-system-state.conf` mounts `/var/lib/grafana` and `/var/lib/prometheus` in system scope. Core and observability services attach to their respective Flight Control targets. The renderer links both targets into `default.target.wants` for user managers. It also installs gateway port and image-builder storage drop-ins for either scope, and a rootless-only image-builder supplementary-group drop-in.
 
 The XDG roots can be relocated by setting `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME`; deployment imports them into the user manager so unit specifiers resolve to the same paths. Do not independently override `CONFIG_WRITEABLE_DIR`, `CONFIG_READONLY_DIR`, `BIN_OUTPUT_DIR`, or `VAR_LIB_OUTPUT_DIR`: the shared units and renderer require those paths to match the systemd specifiers. `QUADLET_FILES_OUTPUT_DIR`, `QUADLET_SYSTEMD_DIR`, and `SYSTEMD_UNIT_OUTPUT_DIR` must remain in recognized search paths for the selected manager; deployment rejects other locations. `VAR_TMP_OUTPUT_DIR` is used in the generated worker storage drop-in. Grafana and Prometheus use `%S/flightctl/{grafana,prometheus}` for user state and `%S/{grafana,prometheus}` in system scope.
 
@@ -315,7 +315,7 @@ podman ps
 
 ### API Health Check
 
-A basic API health check can be performed by calling `/readyz` via the API that will verify that the API is up and running and the connection with database and key-value store is established. A status 200 is returned when healthy.
+A basic API health check can be performed by calling `/_/flightctl/readyz` via the API that will verify that the API is up and running and the connection with database and key-value store is established. A status 200 is returned when healthy.
 
 ```bash
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flightctl"
@@ -327,7 +327,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
   API_PORT="443"
 fi
 DOMAIN="$(python3 "${DATA_DIR}/yaml_helpers.py" extract .global.baseDomain "${CONFIG_DIR}/service-config.yaml" --default localhost)"
-curl -fk "https://${DOMAIN}:${API_PORT}/readyz" && echo OK || echo FAIL
+curl -fk "https://${DOMAIN}:${API_PORT}/_/flightctl/readyz" && echo OK || echo FAIL
 ```
 
 ### Viewing Logs

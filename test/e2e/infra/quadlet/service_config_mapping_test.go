@@ -136,7 +136,8 @@ vulnerabilityReporting:
 			serviceConfigPath := filepath.Join(tmpDir, "service-config.yaml")
 			require.NoError(t, os.WriteFile(serviceConfigPath, []byte(initialServiceConfig), 0600))
 			renderAllMappedServices(t, tmpDir)
-			p := NewInfraProvider(tmpDir, "", false)
+			p, err := NewInfraProvider(tmpDir, "", false)
+			require.NoError(t, err)
 
 			// 1) Get current config (from generated file)
 			content, err := p.GetServiceConfig(service)

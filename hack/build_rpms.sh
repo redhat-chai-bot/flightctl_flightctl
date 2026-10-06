@@ -136,7 +136,7 @@ current_commit() {
 }
 
 ensure_version_env() {
-  SOURCE_GIT_TAG="${SOURCE_GIT_TAG:-$(${SCRIPT_DIR}/current-version)}"
+  SOURCE_GIT_TAG="${SOURCE_GIT_TAG:-$("${SCRIPT_DIR}"/current-version)}"
   SOURCE_GIT_TREE_STATE="${SOURCE_GIT_TREE_STATE:-$(current_tree_state)}"
   SOURCE_GIT_COMMIT="${SOURCE_GIT_COMMIT:-$(current_commit)}"
   export SOURCE_GIT_TAG SOURCE_GIT_TREE_STATE SOURCE_GIT_COMMIT
@@ -158,14 +158,13 @@ print_help_if_requested() {
 }
 
 check_podman_context() {
+  if ! command -v podman >/dev/null 2>&1; then
+    echo "ERROR: RPM builds require Podman. Install and configure Podman for the current user." >&2
+    exit 1
+  fi
   if [[ "$EUID" -eq 0 ]]; then
     echo "Using rootful Podman storage for the RPM build."
     return
-  fi
-
-  if ! command -v podman >/dev/null 2>&1; then
-    echo "ERROR: Rootless RPM builds require Podman. Install and configure Podman for the current user." >&2
-    exit 1
   fi
 
   if [[ -n "${CONTAINER_HOST:-}" || -n "${CONTAINER_CONNECTION:-}" ]]; then
@@ -364,13 +363,13 @@ print_build_summary() {
   for image_info in "${BUILT_IMAGES[@]}"; do
     if [[ "$image_info" == base:* ]]; then
       image_name="${image_info#base:}"
-      echo "\t- Base image: ${image_name}"
+      printf '\t- Base image: %s\n' "${image_name}"
     elif [[ "$image_info" == cache:* ]]; then
       # Format: cache:root_name:image_name
       rest="${image_info#cache:}"
       root_name="${rest%%:*}"
       image_name="${rest#*:}"
-      echo "\t- Mock cache for '${root_name}': ${image_name}"
+      printf "\t- Mock cache for '%s': %s\n" "${root_name}" "${image_name}"
     fi
   done
   echo ""
@@ -430,6 +429,22 @@ pull_images_if_needed() {
 # Main build runner
 ##############################################################################
 
+ensure_user_cache_dir() {
+  local variable_name="$1"
+  local cache_dir="$2"
+
+  if ! mkdir -p "${cache_dir}"; then
+    echo "ERROR: Cannot create ${variable_name} directory ${cache_dir} as uid ${EUID}." >&2
+    echo "Set ${variable_name} to a writable path owned by the current user; this build will not use sudo." >&2
+    exit 1
+  fi
+  if [[ ! -O "${cache_dir}" || ! -w "${cache_dir}" ]]; then
+    echo "ERROR: Rootless RPM builds need ${variable_name} directory ${cache_dir} to be writable and owned by uid ${EUID}." >&2
+    echo "Set ${variable_name} to a user-owned path or fix the directory ownership before retrying." >&2
+    exit 1
+  fi
+}
+
 run_build_in_container() {
   local run_image
 
@@ -474,6 +489,11 @@ run_build_in_container() {
     ensure_user_cache_dir "GOMODCACHE" "${host_gomodcache}"
     ensure_user_cache_dir "GOCACHE" "${host_gocache}"
   else
+    local root_home
+    root_home="$(getent passwd 0 | cut -d: -f6)"
+    [[ -n "${root_home}" ]] || { echo "ERROR: Cannot resolve root's home for build caches" >&2; exit 1; }
+    host_gomodcache="${root_home}/go/pkg/mod"
+    host_gocache="${root_home}/.cache/go-build"
     mkdir -p "${host_gomodcache}" "${host_gocache}"
   fi
 
@@ -486,8 +506,8 @@ run_build_in_container() {
   # preflight checks), but only bind them into Mock's buildroot when its build
   # user can write to them.
   cache_mount_args=(
-    -v "${host_gomodcache}:${container_gomodcache}:z"
-    -v "${host_gocache}:${container_gocache}:z"
+    -v "${host_gomodcache}:${container_gomodcache}"
+    -v "${host_gocache}:${container_gocache}"
   )
   cache_env_args=(
     -e "GOMODCACHE=${container_gomodcache}"
@@ -525,22 +545,6 @@ run_build_in_container() {
     -w /work \
     "${run_image}" \
     ./hack/build_rpms_packit.sh ${ROOT_OPTS[@]+"${ROOT_OPTS[@]}"}
-}
-
-ensure_user_cache_dir() {
-  local variable_name="$1"
-  local cache_dir="$2"
-
-  if ! mkdir -p "${cache_dir}"; then
-    echo "ERROR: Cannot create ${variable_name} directory ${cache_dir} as uid ${EUID}." >&2
-    echo "Set ${variable_name} to a writable path owned by the current user; this build will not use sudo." >&2
-    exit 1
-  fi
-  if [[ ! -O "${cache_dir}" || ! -w "${cache_dir}" ]]; then
-    echo "ERROR: Rootless RPM builds need ${variable_name} directory ${cache_dir} to be writable and owned by uid ${EUID}." >&2
-    echo "Set ${variable_name} to a user-owned path or fix the directory ownership before retrying." >&2
-    exit 1
-  fi
 }
 
 ##############################################################################

@@ -86,8 +86,8 @@ service:
   # Optional: TPM manufacturer / swtpm CA PEM paths for device enrollment (rendered into flightctl-api config).
   # Must be a YAML list, e.g.:
   # tpmCAPaths:
-  #   - <deployment-config-dir>/tpm-cas/swtpm-localca-rootca-cert.pem
-  #   - <deployment-config-dir>/tpm-cas/issuercert.pem
+  #   - /etc/flightctl/tpm-cas/swtpm-localca-rootca-cert.pem
+  #   - /etc/flightctl/tpm-cas/issuercert.pem
   # Rate limiting configuration (applied per-service where enabled).
   rateLimit:
     enabled: true

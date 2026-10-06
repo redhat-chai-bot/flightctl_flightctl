@@ -43,14 +43,14 @@ ifeq ($(AGENT_OS_ID),fedora-bootc)
 # dedicated minimal orchestrator. Selected with AGENT_OS_ID=fedora-bootc, e.g.
 #   AGENT_OS_ID=fedora-bootc make prepare-e2e-test
 $(E2E_AGENT_IMAGES_SENTINEL): | bin
-	RPM_MOCK_ROOT="$(RPM_MOCK_ROOT)" test/scripts/runtime_preflight.sh e2e-prepare
+	RPM_MOCK_ROOT="$(if $(RPM_MOCK_ROOT),$(RPM_MOCK_ROOT),$(RPM_MOCK_ROOT_DEFAULT))" test/scripts/runtime_preflight.sh e2e-prepare
 	SOURCE_GIT_TAG=$(SOURCE_GIT_TAG) SOURCE_GIT_TREE_STATE=$(SOURCE_GIT_TREE_STATE) SOURCE_GIT_COMMIT=$(SOURCE_GIT_COMMIT) \
 		$(ROOT_DIR)/test/scripts/agent-images/build_onboarding_image.sh
 	touch $(E2E_AGENT_IMAGES_SENTINEL)
 else
 # Build + bundle artifacts (no push)
 $(E2E_AGENT_IMAGES_SENTINEL): | bin
-	RPM_MOCK_ROOT="$(RPM_MOCK_ROOT)" test/scripts/runtime_preflight.sh e2e-prepare
+	RPM_MOCK_ROOT="$(if $(RPM_MOCK_ROOT),$(RPM_MOCK_ROOT),$(RPM_MOCK_ROOT_DEFAULT))" test/scripts/runtime_preflight.sh e2e-prepare
 	@set -e; \
 	if [ "$(QCOW2_REBUILD_REQUIRED)" = "true" ] || [ ! -f "$(AGENT_BUNDLE)" ]; then \
 		$(MAKE) bin/.rpm; \
@@ -73,7 +73,7 @@ endif
 # path above.
 .PHONY: e2e-agent-image-onboarding
 e2e-agent-image-onboarding: | bin
-	RPM_MOCK_ROOT="$(RPM_MOCK_ROOT)" test/scripts/runtime_preflight.sh e2e-prepare
+	RPM_MOCK_ROOT="$(if $(RPM_MOCK_ROOT),$(RPM_MOCK_ROOT),$(RPM_MOCK_ROOT_DEFAULT))" test/scripts/runtime_preflight.sh e2e-prepare
 	SOURCE_GIT_TAG=$(SOURCE_GIT_TAG) SOURCE_GIT_TREE_STATE=$(SOURCE_GIT_TREE_STATE) SOURCE_GIT_COMMIT=$(SOURCE_GIT_COMMIT) \
 		$(ROOT_DIR)/test/scripts/agent-images/build_onboarding_image.sh
 
@@ -103,7 +103,6 @@ bin/.e2e-agent-certs:
 .PHONY: e2e-agent-images clean-e2e-agent-images
 
 clean-e2e-agent-images:
-	test/scripts/runtime_preflight.sh clean
 	@uid=$$(id -u); \
 	if [ "$$uid" -eq 0 ]; then echo "Cleaning E2E artifacts and images from root's Podman store..."; else echo "Cleaning E2E artifacts and images from the current user's Podman store..."; fi; \
 	config_home="$${XDG_CONFIG_HOME:-$$HOME/.config}"; \

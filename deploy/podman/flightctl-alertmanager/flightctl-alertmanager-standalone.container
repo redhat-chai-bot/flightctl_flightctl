@@ -19,7 +19,7 @@ PublishPort=9093:9093
 
 # Persistent storage and config
 Volume=flightctl-alertmanager:/var/lib/alertmanager:Z,U
-Volume=/usr/share/flightctl/flightctl-alertmanager/alertmanager.yml:/usr/local/etc/alertmanager/alertmanager.yml:ro,Z
+Volume=%D/flightctl/flightctl-alertmanager/alertmanager.yml:/usr/local/etc/alertmanager/alertmanager.yml:ro
 
 [Service]
 Type=notify

@@ -6,17 +6,18 @@ ROOTLESS_CONFIG="${SCRIPT_DIR}/kind_cluster_rootless.yaml"
 ROOTFUL_CONFIG="${SCRIPT_DIR}/kind_cluster.yaml"
 
 if [[ "$(id -u)" -eq 0 ]]; then
-    kind create cluster --config "${ROOTFUL_CONFIG}"
+    kind create cluster --name "${KIND_CLUSTER_NAME:-kind}" --config "${ROOTFUL_CONFIG}"
 else
     export KIND_EXPERIMENTAL_PROVIDER=podman
-    kind_podman="$(command -v podman)"
+    kind_podman="$(command -v podman)" || { echo "Podman is required for rootless Kind" >&2; exit 1; }
+    export FLIGHTCTL_KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-kind}"
     podman_wrapper_dir="$(mktemp -d "${TMPDIR:-/tmp}/flightctl-kind-podman.XXXXXX")"
     trap 'rm -rf -- "${podman_wrapper_dir}"' EXIT
     ln -s "${SCRIPT_DIR}/podman_kind_wrapper.sh" "${podman_wrapper_dir}/podman"
     export FLIGHTCTL_KIND_REAL_PODMAN="${kind_podman}"
     export PATH="${podman_wrapper_dir}:${PATH}"
     systemd-run --scope --user -p Delegate=yes \
-        kind create cluster --config "${ROOTLESS_CONFIG}"
+        kind create cluster --name "${KIND_CLUSTER_NAME:-kind}" --config "${ROOTLESS_CONFIG}"
 fi
 
 if [[ "${GATEWAY:-}" ]]; then

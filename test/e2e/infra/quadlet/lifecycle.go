@@ -12,15 +12,13 @@ import (
 
 // ServiceLifecycleProvider implements infra.ServiceLifecycleProvider for Quadlet environments.
 type ServiceLifecycleProvider struct {
-	infra   *InfraProvider
-	useSudo bool
+	infra *InfraProvider
 }
 
 // NewServiceLifecycleProvider creates a new Quadlet ServiceLifecycleProvider.
-func NewServiceLifecycleProvider(infraP *InfraProvider, useSudo bool) *ServiceLifecycleProvider {
+func NewServiceLifecycleProvider(infraP *InfraProvider) *ServiceLifecycleProvider {
 	return &ServiceLifecycleProvider{
-		infra:   infraP,
-		useSudo: useSudo,
+		infra: infraP,
 	}
 }
 

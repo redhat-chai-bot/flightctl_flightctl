@@ -482,13 +482,10 @@ func (c *Consumer) startBootcImageBuilderContainer(
 		return nil, fmt.Errorf("config or ImageBuilderWorker config is nil")
 	}
 	rootless := isRootlessRuntime()
-	if rootless {
-		if imageExport.Spec.Format == domain.ExportFormatTypeISO {
-			return nil, fmt.Errorf("rootless ImageExport does not support ISO with the native image-builder CLI: --in-vm currently runs the image pipeline, while the generic ISO target uses a different pipeline; use a rootful worker or export QCOW2/VMDK")
-		}
+	{
 		kvm, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
 		if err != nil {
-			return nil, fmt.Errorf("rootless ImageExport requires accessible /dev/kvm for native image-builder --in-vm: %w (rootless Kind may need a host device ACL for the invoking UID because the KVM group can be unmapped inside the node)", err)
+			return nil, fmt.Errorf("ImageExport requires accessible /dev/kvm for native image-builder --in-vm: %w (rootless Kind may need a host device ACL for the invoking UID because the KVM group can be unmapped inside the node)", err)
 		}
 		if err := kvm.Close(); err != nil {
 			return nil, fmt.Errorf("closing /dev/kvm after access check: %w", err)
@@ -541,17 +538,14 @@ func (c *Consumer) startBootcImageBuilderContainer(
 		"--net=host",
 		"--pull=newer",
 		"--entrypoint", "sleep",
-		// OSBuild's setfiles stage writes SELinux contexts that are not part of
-		// the host policy. The upstream osbuild-container policy grants the
-		// required capability to this domain.
-		"--security-opt", "label=type:osbuild_container_t",
+		"--security-opt", "label=type:unconfined_t",
+		"--device=/dev/kvm:/dev/kvm",
 		"-v", fmt.Sprintf("%s:%s:Z", tmpOutDir, containerOutDir),
 		"-v", fmt.Sprintf("%s:%s:Z", tmpContainerStorage, containerStorageDir),
 	}
 	if rootless {
 		startArgs = append(startArgs,
 			"--group-add=keep-groups",
-			"--device=/dev/kvm:/dev/kvm",
 			"--env=XDG_DATA_HOME=/var/lib",
 			"--env=XDG_RUNTIME_DIR=/tmp/flightctl-podman-runtime",
 		)
@@ -588,31 +582,37 @@ func (c *Consumer) startBootcImageBuilderContainer(
 			log.WithError(err).WithField("path", tmpContainerStorage).Warn("Failed to remove temporary container storage directory")
 		}
 	}
-	if rootless {
+	cleanupFailedPreflight := func() {
+		cleanup()
+		if err := os.RemoveAll(tmpOutDir); err != nil {
+			log.WithError(err).WithField("path", tmpOutDir).Warn("Failed to remove temporary output directory")
+		}
+	}
+	{
 		// The v83 BIB image installs the unified image-builder binary at the
 		// bootc-image-builder path. Its main function selects the compatibility
 		// CLI when argv[0] ends in "bootc-image-builder"; a differently named
 		// symlink selects the native CLI, which supports --in-vm for bootc refs.
 		linkArgs := []string{
 			"exec", containerName, "sh", "-c",
-			"set -eu; builder=\"$(command -v bootc-image-builder)\"; ln -sf \"$builder\" /tmp/image-builder",
+			"set -eu; command -v qemu-system-x86_64 >/dev/null || command -v qemu-system-aarch64 >/dev/null || { echo 'Missing QEMU (qemu-system-x86_64 or qemu-system-aarch64)' >&2; exit 1; }; command -v virtiofsd >/dev/null || test -x /usr/libexec/virtiofsd || { echo 'Missing virtiofsd' >&2; exit 1; }; python3 -c 'import importlib.util; __import__(\"tomli\" if importlib.util.find_spec(\"tomli\") else \"tomllib\")' || { echo 'Missing Python tomli or tomllib module' >&2; exit 1; }; builder=\"$(command -v bootc-image-builder)\" || { echo 'Missing bootc-image-builder binary' >&2; exit 1; }; ln -sf \"$builder\" /tmp/image-builder",
 		}
 		if out, err := podmanCommandWithRuntime(ctx, rootless, podmanRuntimeDir, linkArgs...).CombinedOutput(); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("failed to expose the native image-builder CLI for rootless ImageExport: %w: %s", err, strings.TrimSpace(string(out)))
+			cleanupFailedPreflight()
+			return nil, fmt.Errorf("failed to expose the native image-builder CLI for VM ImageExport: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 
 		buildHelpArgs := []string{"exec", containerName, "/tmp/image-builder", "build", "--help"}
 		buildHelp, err := podmanCommandWithRuntime(ctx, rootless, podmanRuntimeDir, buildHelpArgs...).CombinedOutput()
 		if err != nil {
-			cleanup()
-			return nil, fmt.Errorf("failed to inspect the native image-builder CLI for rootless ImageExport: %w: %s", err, strings.TrimSpace(string(buildHelp)))
+			cleanupFailedPreflight()
+			return nil, fmt.Errorf("failed to inspect the native image-builder CLI for VM ImageExport: %w: %s", err, strings.TrimSpace(string(buildHelp)))
 		}
-		requiredRootlessFlags := []string{"--in-vm", "--bootc-ref", "--bootc-default-fs", "--output-dir", "--output-name"}
-		for _, flag := range requiredRootlessFlags {
+		requiredFlags := []string{"--in-vm", "--bootc-ref", "--bootc-default-fs", "--output-dir", "--output-name"}
+		for _, flag := range requiredFlags {
 			if !strings.Contains(string(buildHelp), flag) {
-				cleanup()
-				return nil, fmt.Errorf("configured builder image %q does not expose native image-builder build %s, required for rootless ImageExport", bootcImageBuilderImage, flag)
+				cleanupFailedPreflight()
+				return nil, fmt.Errorf("configured builder image %q does not expose native image-builder build %s, required for VM ImageExport", bootcImageBuilderImage, flag)
 			}
 		}
 	}
@@ -818,17 +818,11 @@ func (c *Consumer) runBootcImageBuilder(
 	bootcImageRef string,
 	log logrus.FieldLogger,
 ) error {
-	builderCommand := "bootc-image-builder"
-	if worker.Rootless {
-		builderCommand = "native image-builder"
-	}
+	builderCommand := "native image-builder"
 
 	// Map qcow2-disk-container to qcow2 for bootc-image-builder
 	// The container wrapping happens later in executeExport
-	bootcFormat := format
-	if format == domain.ExportFormatTypeQCOW2DiskContainer {
-		bootcFormat = domain.ExportFormatTypeQCOW2
-	}
+	bootcFormat := nativeExportFormat(format)
 
 	log.WithFields(logrus.Fields{
 		"format":      format,
@@ -836,35 +830,7 @@ func (c *Consumer) runBootcImageBuilder(
 		"image":       bootcImageRef,
 	}).Info("Running bootc image exporter")
 
-	var execArgs []string
-	if worker.Rootless {
-		imageType := string(bootcFormat)
-		outputDir := filepath.Join("/output", imageType)
-		outputName := "disk"
-		execArgs = []string{
-			"exec",
-			worker.ContainerName,
-			"/tmp/image-builder",
-			"build",
-			"--in-vm",
-			"--bootc-ref", bootcImageRef,
-			"--bootc-default-fs", "xfs",
-			"--output-dir", outputDir,
-			"--output-name", outputName,
-			imageType,
-		}
-	} else {
-		// The existing rootful path keeps using the BIB compatibility CLI.
-		execArgs = []string{
-			"exec",
-			"-w", "/output",
-			worker.ContainerName,
-			"bootc-image-builder",
-			"--type", string(bootcFormat),
-			"--rootfs", "xfs",
-			bootcImageRef,
-		}
-	}
+	execArgs := nativeImageBuilderArgs(worker.ContainerName, bootcImageRef, format)
 
 	cmd := worker.podmanCommand(ctx, execArgs...)
 
@@ -889,25 +855,24 @@ func (c *Consumer) runBootcImageBuilder(
 	return nil
 }
 
-// findOutputFile returns the path to the output file created by bootc-image-builder
-// bootc-image-builder creates files at {type}/disk.{type} relative to the working directory
-// Since we run with -w /output, files are at /output/{type}/disk.{type} in container
-// which maps to {outputDir}/{type}/disk.{type} on the host
-// Exception: ISO format uses bootiso/install.iso instead of iso/disk.iso
-// Exception: qcow2-disk-container uses qcow2/disk.qcow2 (same as qcow2)
-func (c *Consumer) findOutputFile(outputDir string, format domain.ExportFormatType, log logrus.FieldLogger) (string, error) {
-	var outputFilePath string
-	switch format {
-	case domain.ExportFormatTypeISO:
-		// ISO format uses bootiso/install.iso instead of iso/disk.iso
-		outputFilePath = filepath.Join(outputDir, "bootiso", "install.iso")
-	case domain.ExportFormatTypeQCOW2DiskContainer:
-		// qcow2-disk-container uses qcow2 output from bootc-image-builder
-		outputFilePath = filepath.Join(outputDir, "qcow2", "disk.qcow2")
-	default:
-		// Other formats (vmdk, qcow2) use {format}/disk.{format}
-		outputFilePath = filepath.Join(outputDir, string(format), "disk."+string(format))
+func nativeExportFormat(format domain.ExportFormatType) domain.ExportFormatType {
+	if format == domain.ExportFormatTypeQCOW2DiskContainer {
+		return domain.ExportFormatTypeQCOW2
 	}
+	return format
+}
+
+func nativeImageBuilderArgs(containerName, bootcImageRef string, format domain.ExportFormatType) []string {
+	imageType := string(nativeExportFormat(format))
+	return []string{"exec", containerName, "/tmp/image-builder", "build", "--in-vm", "--bootc-ref", bootcImageRef, "--bootc-default-fs", "xfs", "--output-dir", filepath.Join("/output", imageType), "--output-name", "disk", imageType}
+}
+
+// findOutputFile locates the native CLI's flat disk.{type} output beneath
+// outputDir/{type}, matching --output-dir and --output-name. Container disks
+// use the QCOW2 output and are wrapped separately.
+func (c *Consumer) findOutputFile(outputDir string, format domain.ExportFormatType, log logrus.FieldLogger) (string, error) {
+	imageType := string(nativeExportFormat(format))
+	outputFilePath := filepath.Join(outputDir, imageType, "disk."+imageType)
 
 	// Verify the file exists
 	if _, err := os.Stat(outputFilePath); err != nil {

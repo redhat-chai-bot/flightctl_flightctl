@@ -16,7 +16,7 @@ If you do not have a deployment yet, you can use the **local deployment options*
 
 The tests only assume that FlightCtl is already running and reachable (cluster or Quadlet).
 
-The local Make targets select rootless or rootful behavior from the effective UID. Run them as a regular user for rootless resources or as UID 0 for rootful resources; there is no mode flag. See the [rootless local development guide](../../docs/developer/rootless-development-plan.md) for prerequisites and current image-builder limitations.
+The local Make targets select rootless or rootful behavior from the effective UID. Run them as a regular user for rootless resources or as UID 0 for rootful resources; there is no mode flag. See the [rootless local development guide](../../docs/developer/rootless-deployment.md) for prerequisites and current image-builder limitations.
 
 ## Prerequisites
 

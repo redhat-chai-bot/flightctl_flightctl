@@ -91,7 +91,7 @@ type InfraProvider struct {
 // service hostname used by API endpoints and does not imply an SSH connection.
 // Auth: set E2E_SSH_KEY_PATH for key-based auth, or E2E_SSH_PASSWORD for password auth (requires sshpass).
 // Registry comes from auxiliary; use auxiliary.Get(ctx).Registry.Host/Registry.Port and Registry.Authenticated for credential-required OCI pulls.
-func NewInfraProvider(configDir, secretDir string, useSudo bool) *InfraProvider {
+func NewInfraProvider(configDir, secretDir string, useSudo bool) (*InfraProvider, error) {
 	host := os.Getenv("QUADLET_HOST")
 	sshHost := os.Getenv("E2E_SSH_HOST")
 	if host == "" {
@@ -109,6 +109,9 @@ func NewInfraProvider(configDir, secretDir string, useSudo bool) *InfraProvider 
 	systemScope := useSudo || (!remote && os.Geteuid() == 0) || (remote && sshUser == "root")
 	if configDir == "" {
 		configDir = os.Getenv("E2E_CONFIG_DIR")
+	}
+	if remote && !systemScope && (configDir == "" || os.Getenv("QUADLET_FILES_OUTPUT_DIR") == "") {
+		return nil, fmt.Errorf("remote rootless Quadlets require explicit E2E_CONFIG_DIR and QUADLET_FILES_OUTPUT_DIR from the remote host")
 	}
 	if configDir == "" {
 		if systemScope {
@@ -137,7 +140,7 @@ func NewInfraProvider(configDir, secretDir string, useSudo bool) *InfraProvider 
 		secretDir:  secretDir,
 		unitDir:    unitDir,
 		useSudo:    useSudo,
-	}
+	}, nil
 }
 
 func isLocalHost(host string) bool {

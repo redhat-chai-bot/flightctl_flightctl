@@ -19,5 +19,5 @@ trap 'rm -f "${helm_script}"' EXIT
 curl -fsSL -o "${helm_script}" https://raw.githubusercontent.com/helm/helm/0d0f91d1ce277b2c8766cdc4c7aa04dbafbf2503/scripts/get-helm-3
 echo "6701e269a95eec0a5f67067f504f43ad94e9b4a52ec1205d26b3973d6f5cb3dc  ${helm_script}" | sha256sum --check
 chmod a+x "${helm_script}"
-HELM_INSTALL_DIR="${ROOT_DIR}/bin" "${helm_script}"
+USE_SUDO=false HELM_INSTALL_DIR="${ROOT_DIR}/bin" "${helm_script}" --no-sudo
 test -x "${HELM_BIN}"

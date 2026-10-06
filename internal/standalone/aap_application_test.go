@@ -188,11 +188,8 @@ func TestBuildOAuthApplicationRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := buildOAuthApplicationRequest(tt.baseDomain, tt.appName, tt.organization)
+			req := buildOAuthApplicationRequest(tt.baseDomain, tt.appName, tt.organization, "443")
 			apiPort := "443"
-			if os.Geteuid() != 0 {
-				apiPort = "9443"
-			}
 			apiURL := "https://" + tt.baseDomain + ":" + apiPort
 
 			require.Equal(t, tt.appName, req.Name)
@@ -245,4 +242,14 @@ func TestCreateAAPApplicationWithDownstreamName(t *testing.T) {
 	data, err := os.ReadFile(outputPath)
 	require.NoError(err)
 	require.Equal("downstream-client-id", string(data))
+}
+
+func TestOAuthGatewayPorts(t *testing.T) {
+	for _, port := range []string{"443", "9443"} {
+		t.Run("When gateway port is "+port+" it should preserve authority", func(t *testing.T) {
+			request := buildOAuthApplicationRequest("example.com", "test", 1, port)
+			require.Equal(t, "https://example.com:"+port, request.AppURL)
+			require.Contains(t, request.RedirectURIs, "https://example.com:"+port+"/callback")
+		})
+	}
 }

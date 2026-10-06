@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 OS_ID="${OS_ID:?OS_ID is required}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/bin/output/agent-qcow2-${OS_ID}}"
 
-TAG="${TAG:-$(${ROOT_DIR}/hack/current-version)}"
+TAG="${TAG:-$("${ROOT_DIR}"/hack/current-version)}"
 IMAGE_REPO="${IMAGE_REPO:-quay.io/flightctl/flightctl-device}"
 BASE_IMAGE="${IMAGE_REPO}:base-${OS_ID}-${TAG}"
 
@@ -15,10 +15,6 @@ if [[ "${EUID}" -eq 0 ]]; then
     PODMAN_STORAGE="/var/lib/containers/storage"
     BIB_CACHE_ROOT="${ROOT_DIR}"
 else
-    # The native image-builder CLI in this pinned image supports rootless
-    # bootc builds. Its bootc-image-builder compatibility command does not
-    # expose --in-vm, so rootless invocations use the native CLI by argv[0].
-    BIB_IMAGE="${BIB_IMAGE:-ghcr.io/osbuild/bootc-image-builder@sha256:e7aadce6b3f5639cd47d83354791931ea219891a0d113c2fe74a0f0d352b165c}"
     if ! command -v podman >/dev/null 2>&1; then
         echo "ERROR: Rootless qcow2 builds require Podman for the current user." >&2
         exit 1
@@ -42,6 +38,13 @@ else
         exit 1
     fi
 
+    # The native image-builder CLI in this pinned image supports rootless
+    # bootc builds. Its bootc-image-builder compatibility command does not
+    # expose --in-vm, so rootless invocations use the native CLI by argv[0].
+    if [[ -z "${BIB_IMAGE:-}" ]]; then
+        BIB_IMAGE=localhost/flightctl-vm-image-builder:latest
+        podman build -f "${ROOT_DIR}/hack/Containerfile.bootc-image-builder-rootless" -t "${BIB_IMAGE}" "${ROOT_DIR}"
+    fi
     PODMAN_STORAGE="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null || true)"
     if [[ -z "${PODMAN_STORAGE}" || ! -d "${PODMAN_STORAGE}" ]]; then
         echo "ERROR: Could not locate the current user's Podman image store." >&2
@@ -51,7 +54,16 @@ else
     # The compatibility CLI and native image-builder CLI expose different
     # flags. Verify the native entrypoint has the rootless bootc arguments
     # before starting a potentially expensive build.
-    if ! IMAGE_BUILDER_HELP="$(podman run --rm --pull=newer --entrypoint /bin/sh "${BIB_IMAGE}" -c 'set -eu; ln -sf "$(command -v bootc-image-builder)" /tmp/image-builder; exec /tmp/image-builder build --help' 2>&1)"; then
+    VM_BUILDER_PREFLIGHT="$(cat <<'VM_PREFLIGHT'
+set -eu
+command -v qemu-system-x86_64 >/dev/null || command -v qemu-system-aarch64 >/dev/null
+command -v virtiofsd >/dev/null || test -x /usr/libexec/virtiofsd
+python3 -c 'import importlib.util; __import__("tomli" if importlib.util.find_spec("tomli") else "tomllib")'
+ln -sf "$(command -v bootc-image-builder)" /tmp/image-builder
+exec /tmp/image-builder "$@"
+VM_PREFLIGHT
+)"
+    if ! IMAGE_BUILDER_HELP="$(podman run --rm --pull=newer --entrypoint /bin/sh "${BIB_IMAGE}" -c "${VM_BUILDER_PREFLIGHT}" flightctl-image-builder build --help 2>&1)"; then
         echo "ERROR: Could not inspect the native image-builder CLI in ${BIB_IMAGE} with the current user's Podman runtime." >&2
         echo "Check the image reference, registry access, and Podman pull output, then retry." >&2
         exit 1
@@ -106,7 +118,7 @@ else
         -v "${PODMAN_STORAGE}":/var/lib/containers/storage
     )
     BIB_ARGS=(
-        -c 'set -eu; ln -sf "$(command -v bootc-image-builder)" /tmp/image-builder; exec /tmp/image-builder "$@"'
+        -c "${VM_BUILDER_PREFLIGHT}"
         flightctl-image-builder
         build
         --in-vm

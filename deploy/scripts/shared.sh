@@ -1,36 +1,43 @@
 #!/usr/bin/env bash
 
+[[ -n ${_FLIGHTCTL_SHARED_SH:-} ]] && return
+_FLIGHTCTL_SHARED_SH=1
+
 set -eo pipefail
 
 # Output directory defaults follow the selected manager. User-scope paths can
 # be relocated through XDG_*; independent CONFIG_*, BIN_*, and unit-path
 # overrides must still match the shared Quadlet specifiers.
-if [[ ${EUID} -eq 0 ]]; then
-    : "${CONFIG_WRITEABLE_DIR:=/etc/flightctl}"
-    : "${CONFIG_READONLY_DIR:=/usr/share/flightctl}"
-    : "${QUADLET_FILES_OUTPUT_DIR:=/usr/share/containers/systemd}"
-    : "${SYSTEMD_UNIT_OUTPUT_DIR:=/usr/lib/systemd/system}"
-    : "${QUADLET_SYSTEMD_DIR:=/etc/containers/systemd}"
-    : "${BIN_OUTPUT_DIR:=/usr/bin}"
-    : "${VAR_TMP_OUTPUT_DIR:=/var/tmp}"
-    : "${VAR_LIB_OUTPUT_DIR:=/var/lib}"
-else
-    user_home="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
-    : "${XDG_CONFIG_HOME:=${user_home}/.config}"
-    : "${XDG_DATA_HOME:=${user_home}/.local/share}"
-    : "${XDG_CACHE_HOME:=${user_home}/.cache}"
-    : "${XDG_STATE_HOME:=${user_home}/.local/state}"
-    export XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME
+initialize_runtime_paths() {
+    local user_home
+    if [[ ${EUID} -eq 0 ]]; then
+        : "${CONFIG_WRITEABLE_DIR:=/etc/flightctl}"
+        : "${CONFIG_READONLY_DIR:=/usr/share/flightctl}"
+        : "${QUADLET_FILES_OUTPUT_DIR:=/usr/share/containers/systemd}"
+        : "${SYSTEMD_UNIT_OUTPUT_DIR:=/usr/lib/systemd/system}"
+        : "${QUADLET_SYSTEMD_DIR:=/etc/containers/systemd}"
+        : "${BIN_OUTPUT_DIR:=/usr/bin}"
+        : "${VAR_TMP_OUTPUT_DIR:=/var/tmp}"
+        : "${VAR_LIB_OUTPUT_DIR:=/var/lib}"
+    else
+        user_home="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
+        : "${XDG_CONFIG_HOME:=${user_home}/.config}"
+        : "${XDG_DATA_HOME:=${user_home}/.local/share}"
+        : "${XDG_CACHE_HOME:=${user_home}/.cache}"
+        : "${XDG_STATE_HOME:=${user_home}/.local/state}"
+        export XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME
 
-    : "${CONFIG_WRITEABLE_DIR:=${XDG_CONFIG_HOME}/flightctl}"
-    : "${CONFIG_READONLY_DIR:=${XDG_DATA_HOME}/flightctl}"
-    : "${QUADLET_FILES_OUTPUT_DIR:=${XDG_CONFIG_HOME}/containers/systemd}"
-    : "${SYSTEMD_UNIT_OUTPUT_DIR:=${XDG_CONFIG_HOME}/systemd/user}"
-    : "${QUADLET_SYSTEMD_DIR:=${QUADLET_FILES_OUTPUT_DIR}}"
-    : "${BIN_OUTPUT_DIR:=${XDG_DATA_HOME}/flightctl/bin}"
-    : "${VAR_TMP_OUTPUT_DIR:=${XDG_CACHE_HOME}/flightctl/tmp}"
-    : "${VAR_LIB_OUTPUT_DIR:=${XDG_STATE_HOME}}"
-fi
+        : "${CONFIG_WRITEABLE_DIR:=${XDG_CONFIG_HOME}/flightctl}"
+        : "${CONFIG_READONLY_DIR:=${XDG_DATA_HOME}/flightctl}"
+        : "${QUADLET_FILES_OUTPUT_DIR:=${XDG_CONFIG_HOME}/containers/systemd}"
+        : "${SYSTEMD_UNIT_OUTPUT_DIR:=${XDG_CONFIG_HOME}/systemd/user}"
+        : "${QUADLET_SYSTEMD_DIR:=${QUADLET_FILES_OUTPUT_DIR}}"
+        : "${BIN_OUTPUT_DIR:=${XDG_DATA_HOME}/flightctl/bin}"
+        : "${VAR_TMP_OUTPUT_DIR:=${XDG_CACHE_HOME}/flightctl/tmp}"
+        : "${VAR_LIB_OUTPUT_DIR:=${XDG_STATE_HOME}}"
+    fi
+}
+initialize_runtime_paths
 
 # Use this command wrapper for systemd control in deployment helpers. An
 # unprivileged process always operates on its own systemd user manager.
@@ -67,8 +74,6 @@ validate_runtime_output_paths() {
         expected_writeable=/etc/flightctl
         expected_readonly=/usr/share/flightctl
         expected_bin=/usr/bin
-        expected_systemd=/usr/lib/systemd/system
-        expected_quadlet_systemd=/etc/containers/systemd
 
         case "${QUADLET_FILES_OUTPUT_DIR%/}" in
             /usr/share/containers/systemd|/etc/containers/systemd|/usr/lib/containers/systemd) ;;
@@ -87,11 +92,12 @@ validate_runtime_output_paths() {
             return 1
         fi
     else
-        local user_home="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
+        local user_home
+        user_home="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
         local xdg_config_home="${XDG_CONFIG_HOME:-${user_home}/.config}"
         local xdg_data_home="${XDG_DATA_HOME:-${user_home}/.local/share}"
 
-        if [[ "${xdg_config_home}" != /* || "${xdg_data_home}" != /* || "${XDG_CACHE_HOME}" != /* || "${XDG_STATE_HOME}" != /* ]]; then
+        if [[ "${xdg_config_home}" != /* || "${xdg_data_home}" != /* || "${XDG_CACHE_HOME:-${user_home}/.cache}" != /* || "${XDG_STATE_HOME:-${user_home}/.local/state}" != /* ]]; then
             echo "Error: XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_CACHE_HOME, and XDG_STATE_HOME must be absolute paths" >&2
             return 1
         fi
@@ -153,7 +159,8 @@ source "${SHARED_SCRIPT_DIR}"/init_utils.sh
 is_external_database_enabled() {
     local config_file="${CONFIG_WRITEABLE_DIR}/service-config.yaml"
     if [[ -f "$config_file" ]]; then
-        local external_value=$(extract_value "external" "$config_file" | grep -v "^#" | head -1)
+        local external_value
+        external_value=$(extract_value "external" "$config_file" | grep -v "^#" | head -1)
         [[ "$external_value" == "enabled" ]]
     else
         false
@@ -191,7 +198,11 @@ render_service() {
         fi
 
         echo "copy container: ${container_file} -> ${dest_container}"
-        install -m 644 "$container_file" "${dest_container}"
+        { printf '# Generated by Flight Control deployment; do not edit.\n'; cat "$container_file"; } > "${dest_container}"
+        if [[ "${EUID}" -ne 0 ]]; then
+            sed -i -E 's/^(Volume=%D\/.*:ro)$/\1,z/' "${dest_container}"
+        fi
+        chmod 644 "${dest_container}"
     else
         # Normal mode - process container files based on configuration
         mkdir -p "${QUADLET_FILES_OUTPUT_DIR}"
@@ -200,7 +211,8 @@ render_service() {
         for container_file in "${source_dir}/flightctl-${service_name}"/*.container; do
             if [[ -f "$container_file" ]] &&
                [[ ! "$container_file" == *"-standalone.container" ]]; then
-                local base_filename=$(basename "$container_file")
+                local base_filename
+                base_filename=$(basename "$container_file")
                 local dest_container="${QUADLET_FILES_OUTPUT_DIR}/${base_filename}"
 
                 # Validate source file exists and is readable
@@ -210,19 +222,22 @@ render_service() {
                 fi
 
                 echo "copy container: ${container_file} -> ${dest_container}"
-                install -m 644 "$container_file" "${dest_container}"
+                { printf '# Generated by Flight Control deployment; do not edit.\n'; cat "$container_file"; } > "${dest_container}"
+                chmod 644 "${dest_container}"
             fi
         done
 
         # Process .service files for systemd services
         for service_file in "${source_dir}/flightctl-${service_name}"/*.service; do
             if [[ -f "$service_file" ]]; then
-                local base_filename=$(basename "$service_file")
+                local base_filename
+                base_filename=$(basename "$service_file")
                 # Guarantee target dir exists to avoid a fatal cp error
                 mkdir -p "${SYSTEMD_UNIT_OUTPUT_DIR}"
                 local dest_service="${SYSTEMD_UNIT_OUTPUT_DIR}/${base_filename}"
                 echo "copy service: ${service_file} -> ${dest_service}"
-                cp "$service_file" "${dest_service}"
+                { printf '# Generated by Flight Control deployment; do not edit.\n'; cat "$service_file"; } > "${dest_service}"
+                chmod 644 "${dest_service}"
             fi
         done
     fi
@@ -234,7 +249,8 @@ render_service() {
             if [[ -f "$config_file" ]]; then
                 # Ensure config output directory exists
                 mkdir -p "${CONFIG_READONLY_DIR}/flightctl-${service_name}"
-                local dest_config="${CONFIG_READONLY_DIR}/flightctl-${service_name}/$(basename "$config_file")"
+                local dest_config
+                dest_config="${CONFIG_READONLY_DIR}/flightctl-${service_name}/$(basename "$config_file")"
                 echo "copy config: ${config_file} -> ${dest_config}"
                 cp "$config_file" "${dest_config}"
             fi
@@ -244,9 +260,11 @@ render_service() {
     # Move any .volume file if it exists
     for volume in "${source_dir}/flightctl-${service_name}"/*.volume; do
         if [[ -f "$volume" ]]; then
-            local dest_volume="${QUADLET_FILES_OUTPUT_DIR}/$(basename "$volume")"
+            local dest_volume
+            dest_volume="${QUADLET_FILES_OUTPUT_DIR}/$(basename "$volume")"
             echo "copy volume: ${volume} -> ${dest_volume}"
-            cp "$volume" "${dest_volume}"
+            { printf '# Generated by Flight Control deployment; do not edit.\n'; cat "$volume"; } > "${dest_volume}"
+            chmod 644 "${dest_volume}"
         fi
     done
 }

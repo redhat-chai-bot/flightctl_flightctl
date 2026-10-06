@@ -1054,7 +1054,7 @@ func (w *podmanWorker) installCACert(ctx context.Context, caCrt *string, registr
 	if w.RegistryCertDirs == nil {
 		w.RegistryCertDirs = make(map[string]string)
 	}
-	w.RegistryCertDirs[registryHostname] = certRoot
+	w.RegistryCertDirs[registryHostname] = certDir
 	log.WithFields(logrus.Fields{
 		"certPath":         certPath,
 		"registryHostname": registryHostname,

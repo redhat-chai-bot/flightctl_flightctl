@@ -9,6 +9,7 @@ import (
 	"github.com/flightctl/flightctl/api/core/v1beta1"
 	agentcfg "github.com/flightctl/flightctl/internal/agent/config"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 	"sigs.k8s.io/yaml"
 )
 
@@ -66,14 +67,10 @@ func (h *Harness) SetupVMFromPoolWithTPM(workerID int, detected TPMType) error {
 	return nil
 }
 
-// HostHasTPMDevice returns true if the current user can open the specified TPM
+// HostHasTPMDevice returns true if the current user can access the specified TPM
 // device for read/write access, as required for libvirt passthrough.
 func HostHasTPMDevice(device string) bool {
-	file, err := os.OpenFile(device, os.O_RDWR, 0)
-	if err != nil {
-		return false
-	}
-	return file.Close() == nil
+	return unix.Access(device, unix.R_OK|unix.W_OK) == nil
 }
 
 // SetupVMWithTPMPassthrough creates a fresh VM with TPM passthrough and starts the agent.

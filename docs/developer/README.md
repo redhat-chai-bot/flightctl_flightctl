@@ -86,7 +86,7 @@ The service can be deployed locally in kind with the following command:
 make deploy
 ```
 
-Rootless deployment support covers user-scope Quadlets and the ImageBuilder paths used by Quadlets and rootless Kind. Run the Make targets as the account that should own the local deployment; the effective UID selects the matching scope, and UID 0 keeps the rootful setup. See the [rootless deployment and local workflows guide](rootless-development-plan.md) for host prerequisites and current ImageBuilder limitations.
+Rootless deployment support covers user-scope Quadlets and the ImageBuilder paths used by Quadlets and rootless Kind. Run the Make targets as the account that should own the local deployment; the effective UID selects the matching scope, and UID 0 keeps the rootful setup. See the [rootless deployment and local workflows guide](rootless-deployment.md) for host prerequisites and current ImageBuilder limitations.
 
 Note: An update to firewalld may need to be made if the agent is unable to connect to the api instance:
 
@@ -108,16 +108,7 @@ For a regular-user deployment, writable service configuration and certificates a
 Use the `flightctl` CLI to login and then apply, get, or delete resources:
 
 ```
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flightctl"
-DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/flightctl"
-API_PORT=9443
-if [[ "$(id -u)" -eq 0 ]]; then
-  CONFIG_DIR=/etc/flightctl
-  DATA_DIR=/usr/share/flightctl
-  API_PORT=443
-fi
-API_HOST="$(python3 "${DATA_DIR}/yaml_helpers.py" extract .global.baseDomain "${CONFIG_DIR}/service-config.yaml" --default localhost)"
-bin/flightctl login "https://${API_HOST}:${API_PORT}" --web --certificate-authority "${CONFIG_DIR}/pki/ca.crt"
+# Run the login command printed by make deploy-quadlets.
 bin/flightctl apply -f examples/fleet.yaml
 bin/flightctl get fleets
 bin/flightctl get fleet fleet1 fleet2  # Get multiple specific resources

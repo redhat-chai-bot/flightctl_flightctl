@@ -1,9 +1,18 @@
 ARG BOOTC_IMAGE_BUILDER_IMAGE=ghcr.io/osbuild/bootc-image-builder@sha256:e7aadce6b3f5639cd47d83354791931ea219891a0d113c2fe74a0f0d352b165c
+FROM docker.io/library/golang:1.26 AS builder
+RUN git clone --branch v83.0.0 --single-branch https://github.com/osbuild/image-builder.git /src
+WORKDIR /src
+RUN grep -Fq 'buildOpts.InVm = []string{"image"}' cmd/image-builder/main.go \
+    && sed -i 's/buildOpts.InVm = \[\]string{"image"}/buildOpts.InVm = img.ImgType.Exports()/' cmd/image-builder/main.go \
+    && CGO_ENABLED=0 go build -o /image-builder ./cmd/image-builder
+
 FROM ${BOOTC_IMAGE_BUILDER_IMAGE}
+COPY --from=builder /image-builder /usr/bin/bootc-image-builder
 
-ARG QEMU_SYSTEM_PACKAGE=qemu-system-x86-core
+ARG QEMU_SYSTEM_PACKAGE
 
-RUN dnf -y install "${QEMU_SYSTEM_PACKAGE}" virtiofsd python3-tomli && dnf clean all
+RUN case "$(uname -m)" in x86_64) QEMU_SYSTEM_PACKAGE="${QEMU_SYSTEM_PACKAGE:-qemu-system-x86-core}" ;; aarch64) QEMU_SYSTEM_PACKAGE="${QEMU_SYSTEM_PACKAGE:-qemu-system-aarch64-core}" ;; *) exit 1 ;; esac \
+    && dnf -y install "${QEMU_SYSTEM_PACKAGE}" virtiofsd python3-tomli && dnf clean all
 
 # The OSBuild VM mounts the directory containing the osbuild Python package.
 # Fedora installs python3-tomli under /usr/lib64, outside that mounted directory,
@@ -11,5 +20,4 @@ RUN dnf -y install "${QEMU_SYSTEM_PACKAGE}" virtiofsd python3-tomli && dnf clean
 RUN OSBUILD_SITE_PACKAGES="$(python3 -c 'import osbuild, pathlib; print(pathlib.Path(osbuild.__file__).resolve().parent.parent)')" \
     && TOMLI_PACKAGE_DIR="$(python3 -c 'import pathlib, tomli; print(pathlib.Path(tomli.__file__).resolve().parent)')" \
     && install -d "${OSBUILD_SITE_PACKAGES}/tomli" \
-    && cp "${TOMLI_PACKAGE_DIR}"/*.py "${OSBUILD_SITE_PACKAGES}/tomli/" \
-    && cp "${TOMLI_PACKAGE_DIR}/py.typed" "${OSBUILD_SITE_PACKAGES}/tomli/"
+    && cp -a "${TOMLI_PACKAGE_DIR}/." "${OSBUILD_SITE_PACKAGES}/tomli/"

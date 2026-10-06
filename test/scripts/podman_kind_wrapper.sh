@@ -26,7 +26,7 @@ if [[ "${args[0]:-}" == "run" ]]; then
     # Kind v0.26's Podman provider does not set keep-groups on its node
     # containers. Preserve the invoking user's KVM group for the /dev/kvm
     # device mounted into a rootless Kind node.
-    if [[ "${node_name}" == kind-* ]]; then
+    if [[ "${node_name}" == "${FLIGHTCTL_KIND_CLUSTER_NAME:-kind}-"* ]]; then
         exec "${real_podman}" run --group-add=keep-groups "${args[@]:1}"
     fi
 fi

@@ -22,11 +22,12 @@ import (
 var defaultAAPOAuthAppName = "Flight Control"
 
 type CreateAAPApplicationOptions struct {
-	Config       string
-	OutputFile   string
-	CACertFile   string
-	AppName      string
-	Organization int
+	Config         string
+	OutputFile     string
+	CACertFile     string
+	AppName        string
+	Organization   int
+	RendererConfig *renderer.RendererConfig
 }
 
 func NewAAPCommand() *cobra.Command {
@@ -45,8 +46,8 @@ func NewAAPCommand() *cobra.Command {
 }
 
 func NewCreateAAPApplicationCommand() *cobra.Command {
-	opts := &CreateAAPApplicationOptions{}
-	defaultConfigDir := renderer.NewRendererConfig().WriteableConfigOutputDir
+	opts := &CreateAAPApplicationOptions{RendererConfig: renderer.NewRendererConfig()}
+	defaultConfigDir := opts.RendererConfig.WriteableConfigOutputDir
 
 	cmd := &cobra.Command{
 		Use:   "create-oauth-application",
@@ -145,22 +146,24 @@ func (o *CreateAAPApplicationOptions) Run(cmd *cobra.Command) error {
 	defer cancel()
 
 	client, err := standalone.CreateAAPClient(standalone.CreateAAPClientOptions{
-		AAPConfig:       aapConfig,
-		InsecureSkipTLS: config.Global.Auth.InsecureSkipTlsVerify,
-		CACertFile:      o.CACertFile,
-		Logger:          logger,
+		AAPConfig:         aapConfig,
+		InsecureSkipTLS:   config.Global.Auth.InsecureSkipTlsVerify,
+		CACertFile:        o.CACertFile,
+		DefaultCACertFile: filepath.Join(o.RendererConfig.WriteableConfigOutputDir, "pki", "auth", "ca.crt"),
+		Logger:            logger,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create AAP client: %w", err)
 	}
 
 	return standalone.CreateAAPApplication(ctx, standalone.CreateAAPApplicationOptions{
-		AAPConfig:    aapConfig,
-		BaseDomain:   config.Global.BaseDomain,
-		Client:       client,
-		Logger:       logger,
-		AppName:      o.AppName,
-		Organization: o.Organization,
-		OutputFile:   o.OutputFile,
+		AAPConfig:       aapConfig,
+		BaseDomain:      config.Global.BaseDomain,
+		GatewayHostPort: o.RendererConfig.GatewayHostPort,
+		Client:          client,
+		Logger:          logger,
+		AppName:         o.AppName,
+		Organization:    o.Organization,
+		OutputFile:      o.OutputFile,
 	})
 }

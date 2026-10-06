@@ -13,8 +13,6 @@ PublishPort=3000:3000
 Network=flightctl.network
 AddHost=%H:host-gateway
 
-# Volume for Grafana's primary data (database, compiled assets, plugins)
-Volume=%S/grafana:/var/lib/grafana:rw,z,U
 
 # Mount custom grafana.ini file
 Volume=%E/flightctl/flightctl-grafana/grafana.ini:/etc/grafana/grafana.ini:ro,z
@@ -36,4 +34,4 @@ Restart=on-failure
 ExecStartPre=/usr/bin/env PATH=%D/flightctl/bin:/usr/bin:/bin flightctl-standalone render template --config %E/flightctl/service-config.yaml --input-file %D/flightctl/flightctl-grafana/grafana.ini.template --output-file %E/flightctl/flightctl-grafana/grafana.ini
 
 [Install]
-WantedBy=default.target
+WantedBy=flightctl-observability.target

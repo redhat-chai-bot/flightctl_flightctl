@@ -141,6 +141,10 @@ Prometheus for metric storage and Grafana for visualization.
 %{_datadir}/containers/systemd/flightctl-grafana.container
 %{_datadir}/containers/systemd/flightctl-prometheus.container
 %{_datadir}/containers/systemd/flightctl-userinfo-proxy.container
+%dir %{_datadir}/containers/systemd/flightctl-grafana.container.d
+%{_datadir}/containers/systemd/flightctl-grafana.container.d/98-system-state.conf
+%dir %{_datadir}/containers/systemd/flightctl-prometheus.container.d
+%{_datadir}/containers/systemd/flightctl-prometheus.container.d/98-system-state.conf
 
 # Systemd target for full observability stack
 /usr/lib/systemd/system/flightctl-observability.target
@@ -676,17 +680,18 @@ fi
     %{_datadir}/containers/systemd/flightctl-pam-issuer.container
     %{_datadir}/containers/systemd/flightctl-pam-issuer-etc.volume
     %{_datadir}/containers/systemd/flightctl-gateway.container
+    %dir %{_datadir}/containers/systemd/flightctl-gateway.container.d
     %{_datadir}/containers/systemd/flightctl-gateway.container.d/10-api-host-port.conf
-    %{_datadir}/containers/systemd/flightctl-gateway.container.d/20-upstream-checks.conf
     %{_datadir}/containers/systemd/flightctl-ui*.container
     %{_datadir}/containers/systemd/flightctl-ui-certs.volume
+    %dir %{_datadir}/containers/systemd/flightctl-imagebuilder-worker.container.d
+    %{_datadir}/containers/systemd/flightctl-imagebuilder-worker.container.d/20-build-storage.conf
     %{_datadir}/containers/systemd/flightctl-imagebuilder*.container
     %{_datadir}/containers/systemd/flightctl-remote-access.container
     %{_datadir}/containers/systemd/flightctl-alertmanager.volume
     %{_datadir}/containers/systemd/flightctl-telemetry-gateway.container
     %{_datadir}/containers/systemd/flightctl.network
     %{_datadir}/containers/systemd/flightctl-listeners.volume
-    %{_datadir}/containers/systemd/flightctl-imagebuilder-worker.container.d/20-build-storage.conf
 
     # Handle permissions for scripts setting host config
     %attr(0755,root,root) %{_datadir}/flightctl/init_db.sh

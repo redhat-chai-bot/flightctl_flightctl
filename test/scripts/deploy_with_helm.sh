@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -x -eo pipefail
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-METHOD=install
 ONLY_DB=
 DB_SIZE_PARAMS=
 # If using images from a private registry, specify a path to a Kubernetes Secret yaml for your pull secret (in the flightctl-internal namespace)
@@ -96,19 +95,19 @@ SERVICE_IMAGE_ARGS="$SERVICE_IMAGE_ARGS --set remoteAccess.image.image=${REMOTE_
 # Expose only the KVM device needed by native image-builder --in-vm on a
 # rootless Podman kind node. The worker backend detects its own runtime.
 WORKER_DEVICE_ARGS=""
-if [[ "$(id -u)" -ne 0 ]]; then
-  if ! podman exec kind-control-plane test -c /dev/kvm 2>/dev/null; then
-    echo "Could not find the mounted /dev/kvm device inside the rootless kind node. Confirm the device mount in test/scripts/kind_cluster_rootless.yaml and recreate the cluster." >&2
-    exit 1
+if [[ -z "${ONLY_DB}" && "$(id -u)" -ne 0 ]]; then
+  if podman exec "${KIND_CLUSTER_NAME:-kind}-control-plane" test -c /dev/kvm 2>/dev/null; then
+    WORKER_DEVICE_ARGS="--set imageBuilderWorker.kvmDevice.enabled=true --set imageBuilderWorker.hostDevices.enabled=false"
+  else
+    echo "Warning: ImageExport needs KVM inside the rootless kind node; API and ImageBuild deployment can continue." >&2
   fi
-  WORKER_DEVICE_ARGS="--set imageBuilderWorker.kvmDevice.enabled=true --set imageBuilderWorker.hostDevices.enabled=false"
 fi
 
 # helm expects the namespaces to exist, and creating namespaces
 # inside the helm charts is not recommended.
-kubectl create namespace flightctl-external --context kind-kind 2>/dev/null || true
-kubectl create namespace flightctl-internal --context kind-kind 2>/dev/null || true
-kubectl create namespace flightctl-e2e      --context kind-kind 2>/dev/null || true
+kubectl create namespace flightctl-external --context "kind-${KIND_CLUSTER_NAME:-kind}" 2>/dev/null || true
+kubectl create namespace flightctl-internal --context "kind-${KIND_CLUSTER_NAME:-kind}" 2>/dev/null || true
+kubectl create namespace flightctl-e2e      --context "kind-${KIND_CLUSTER_NAME:-kind}" 2>/dev/null || true
 
 # if we are only deploying the database, we don't need inject the server container
 if [ -z "$ONLY_DB" ]; then
@@ -137,9 +136,9 @@ else
   SERVICE_IMAGE_ARGS=""
 fi
 
-if [ ! -z "$IMAGE_PULL_SECRET_PATH" ]; then
-  PULL_SECRET_NAME=$(cat "$IMAGE_PULL_SECRET_PATH" | yq .metadata.name)
-  PULL_SECRET_NAMESPACE=$(cat "$IMAGE_PULL_SECRET_PATH" | yq .metadata.namespace)
+if [ -n "$IMAGE_PULL_SECRET_PATH" ]; then
+  PULL_SECRET_NAME=$(yq .metadata.name "$IMAGE_PULL_SECRET_PATH")
+  PULL_SECRET_NAMESPACE=$(yq .metadata.namespace "$IMAGE_PULL_SECRET_PATH")
 
   if [ "$PULL_SECRET_NAMESPACE" != "flightctl-internal" ]; then
     echo "Namespace for IMAGE_PULL_SECRET_PATH must be flightctl-internal"
@@ -152,10 +151,8 @@ fi
 
 kind_load_image "${SQL_IMAGE}:${SQL_VERSION}" keep-tar
 
-API_PORT=3443
 GATEWAY_ARGS=""
 if [ "$GATEWAY" ]; then
-  API_PORT=4443
   GATEWAY_ARGS="--set global.exposeServicesMethod=gateway --set global.gatewayClass=contour-gateway --set global.gatewayPorts.tls=4443 --set global.gatewayPorts.http=4480"
 fi
 
@@ -174,7 +171,7 @@ helm dependency build ./deploy/helm/flightctl
 
 # Format IP for DNS: use sslip.io for IPv6 (replace : with -), nip.io for IPv4
 if [[ "$IP" == *":"* ]]; then
-  BASE_DOMAIN="$(echo $IP | tr ':' '-').sslip.io"
+  BASE_DOMAIN="$(echo "$IP" | tr ':' '-').sslip.io"
 else
   BASE_DOMAIN="${IP}.nip.io"
 fi
@@ -188,22 +185,22 @@ if [[ "${GITHUB_ACTIONS:-}" == "true" ]] && [[ "$IP" != *":"* ]]; then
   fi
 fi
 
+read -r -a HELM_EXTRA_ARGS <<< "${SECRET_ACCESS_ARGS} ${ONLY_DB} ${DB_SIZE_PARAMS} ${AUTH_ARGS} ${SQL_ARG} ${GATEWAY_ARGS} ${KV_ARG} ${SERVICE_IMAGE_ARGS} ${WORKER_DEVICE_ARGS}"
 helm upgrade --install --namespace flightctl-external \
                   --values ./deploy/helm/flightctl/values.dev.yaml \
-                  --set global.baseDomain=${BASE_DOMAIN} \
-                  ${SECRET_ACCESS_ARGS} \
-                  ${ONLY_DB} ${DB_SIZE_PARAMS} ${AUTH_ARGS} ${SQL_ARG} ${GATEWAY_ARGS} ${KV_ARG} ${SERVICE_IMAGE_ARGS} ${WORKER_DEVICE_ARGS} flightctl \
-              ./deploy/helm/flightctl/ --kube-context kind-kind
+                  --set "global.baseDomain=${BASE_DOMAIN}" \
+                  "${HELM_EXTRA_ARGS[@]}" flightctl \
+              ./deploy/helm/flightctl/ --kube-context "kind-${KIND_CLUSTER_NAME:-kind}"
 
 "${SCRIPT_DIR}"/wait_for_postgres.sh
 
 # Wait for Redis deployment to be ready
-kubectl rollout status deployment flightctl-kv -n flightctl-internal -w --timeout=300s --context kind-kind
+kubectl rollout status deployment flightctl-kv -n flightctl-internal -w --timeout=300s --context "kind-${KIND_CLUSTER_NAME:-kind}"
 
 # Make sure the database is usable from the unit tests
-DB_POD=$(kubectl get pod -n flightctl-internal -l flightctl.service=flightctl-db --no-headers -o custom-columns=":metadata.name" --context kind-kind )
-kubectl exec -n flightctl-internal --context kind-kind "${DB_POD}" -- psql -c 'ALTER ROLE admin WITH SUPERUSER'
-kubectl exec -n flightctl-internal --context kind-kind "${DB_POD}" -- createdb admin 2>/dev/null|| true
+DB_POD=$(kubectl get pod -n flightctl-internal -l flightctl.service=flightctl-db --no-headers -o custom-columns=":metadata.name" --context "kind-${KIND_CLUSTER_NAME:-kind}" )
+kubectl exec -n flightctl-internal --context "kind-${KIND_CLUSTER_NAME:-kind}" "${DB_POD}" -- psql -c 'ALTER ROLE admin WITH SUPERUSER'
+kubectl exec -n flightctl-internal --context "kind-${KIND_CLUSTER_NAME:-kind}" "${DB_POD}" -- createdb admin 2>/dev/null|| true
 
 
 if [ "$ONLY_DB" ]; then
@@ -220,7 +217,7 @@ for i in {1..60}; do
   if try_login; then
     break
   fi
-  if [ $i -eq 60 ]; then
+  if [ "$i" -eq 60 ]; then
     echo "Failed to login to the API after 60 attempts"
     exit 1
   fi

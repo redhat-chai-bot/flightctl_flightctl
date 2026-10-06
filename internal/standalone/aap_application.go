@@ -8,10 +8,8 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"path/filepath"
 
 	standaloneconfig "github.com/flightctl/flightctl/internal/config/standalone"
-	"github.com/flightctl/flightctl/internal/quadlet/renderer"
 	"github.com/flightctl/flightctl/pkg/aap"
 	"github.com/sirupsen/logrus"
 )
@@ -21,10 +19,11 @@ type OAuthApplicationCreator interface {
 }
 
 type CreateAAPClientOptions struct {
-	AAPConfig       *standaloneconfig.AAPConfig
-	InsecureSkipTLS bool
-	CACertFile      string
-	Logger          logrus.FieldLogger
+	AAPConfig         *standaloneconfig.AAPConfig
+	InsecureSkipTLS   bool
+	CACertFile        string
+	DefaultCACertFile string
+	Logger            logrus.FieldLogger
 }
 
 func CreateAAPClient(opts CreateAAPClientOptions) (*aap.AAPGatewayClient, error) {
@@ -59,7 +58,7 @@ func buildTLSConfig(opts CreateAAPClientOptions) (*tls.Config, error) {
 			}
 			tlsConfig.RootCAs = caCertPool
 			opts.Logger.Infof("Using CA certificate from %s", opts.CACertFile)
-		} else if opts.CACertFile != filepath.Join(renderer.NewRendererConfig().WriteableConfigOutputDir, "pki", "auth", "ca.crt") {
+		} else if opts.CACertFile != opts.DefaultCACertFile {
 			opts.Logger.Warnf("Configured CA cert file not found: %s - using system CAs", opts.CACertFile)
 		}
 	}
@@ -68,19 +67,23 @@ func buildTLSConfig(opts CreateAAPClientOptions) (*tls.Config, error) {
 }
 
 type CreateAAPApplicationOptions struct {
-	Client       OAuthApplicationCreator
-	Logger       logrus.FieldLogger
-	AAPConfig    *standaloneconfig.AAPConfig
-	BaseDomain   string
-	AppName      string
-	Organization int
-	OutputFile   string
+	Client          OAuthApplicationCreator
+	Logger          logrus.FieldLogger
+	AAPConfig       *standaloneconfig.AAPConfig
+	BaseDomain      string
+	GatewayHostPort string
+	AppName         string
+	Organization    int
+	OutputFile      string
 }
 
 // CreateAAPApplication creates an OAuth application in AAP Gateway and writes
 // the client_id to the specified output file.
 func CreateAAPApplication(ctx context.Context, opts CreateAAPApplicationOptions) error {
-	request := buildOAuthApplicationRequest(opts.BaseDomain, opts.AppName, opts.Organization)
+	if opts.GatewayHostPort == "" {
+		opts.GatewayHostPort = "443"
+	}
+	request := buildOAuthApplicationRequest(opts.BaseDomain, opts.AppName, opts.Organization, opts.GatewayHostPort)
 	clientID, err := createOAuthApplication(ctx, opts.Client, opts.AAPConfig.Token, request)
 	if err != nil {
 		return fmt.Errorf("failed to create OAuth application: %w", err)
@@ -96,8 +99,8 @@ func CreateAAPApplication(ctx context.Context, opts CreateAAPApplicationOptions)
 	return nil
 }
 
-func buildOAuthApplicationRequest(baseDomain string, appName string, organization int) *aap.AAPOAuthApplicationRequest {
-	apiHost := net.JoinHostPort(baseDomain, renderer.NewRendererConfig().GatewayHostPort)
+func buildOAuthApplicationRequest(baseDomain string, appName string, organization int, gatewayHostPort string) *aap.AAPOAuthApplicationRequest {
+	apiHost := net.JoinHostPort(baseDomain, gatewayHostPort)
 	appURL := url.URL{Scheme: "https", Host: apiHost}
 	callbackURL := url.URL{Scheme: "https", Host: apiHost, Path: "/callback"}
 	// Local callback URLs are used by the CLI OAuth flow. Include both localhost

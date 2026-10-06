@@ -387,7 +387,6 @@ rebuild-containers: clean-containers build-containers
 
 # Clean only containers (preserve cluster and other artifacts)
 clean-containers:
-	test/scripts/runtime_preflight.sh clean
 	- podman images --filter "reference=flightctl-*-$(OS):latest" --format "{{.Repository}}:{{.Tag}}" | xargs -r podman rmi || true
 
 build-containers: flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-delta-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-multiarch-cli-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container flightctl-remote-access-container
@@ -502,57 +501,18 @@ deb: bin/arm64 bin/amd64 bin/riscv64
 .PHONY: clean clean-all clean-quadlets clean-e2e-vms
 clean: clean-agent-vm clean-e2e-vms clean-e2e-agent-images clean-quadlets clean-swtpm-certs clean-e2e-certs clean-aux
 	- PATH="$(ROOT_DIR)/bin:$$PATH" test/scripts/delete_kind_cluster.sh
-	-@uid=$$(id -u); \
-	cleanup_path() { \
-		path="$$1"; \
-		[ -e "$$path" ] || [ -L "$$path" ] || return 0; \
-		if [ "$$uid" -ne 0 ]; then \
-			other_owner=$$(find "$$path" -xdev ! -uid "$$uid" -print -quit 2>/dev/null); \
-			find_status=$$?; \
-			if [ "$$find_status" -ne 0 ]; then \
-				echo "Leaving $$path because its ownership could not be checked; inspect it as the owning user." >&2; \
-				return 0; \
-			fi; \
-			if [ -n "$$other_owner" ]; then \
-				echo "Leaving $$path because it contains files not owned by uid $$uid; clean those artifacts as their owner." >&2; \
-				return 0; \
-			fi; \
-		fi; \
-			find "$$path" -xdev -depth -delete || echo "Warning: failed to remove $$path without crossing filesystem boundaries" >&2; \
-	}; \
-	cleanup_path "$$HOME/.flightctl"; \
-	cleanup_path "$(shell uname -m)"; \
-	for path in obj-*-linux-gnu; do cleanup_path "$$path"; done; \
-	cleanup_path debian; \
-	cleanup_path .output/stamps; \
-	cleanup_path bin/flightctl-images-bundle.tar
+	-bash hack/clean_owned_path.sh "$$HOME/.flightctl" "$$(uname -m)" obj-*-linux-gnu debian .output/stamps bin/flightctl-images-bundle.tar
 # Full cleanup including bin directory and all artifacts
 clean-all: clean clean-containers
-	-@uid=$$(id -u); \
-	if [ "$$uid" -eq 0 ]; then \
-		if [ -e bin ] || [ -L bin ]; then \
-			find bin -xdev -depth -delete || echo "Warning: failed to remove bin without crossing filesystem boundaries" >&2; \
-		fi; \
-	elif [ -e bin ] || [ -L bin ]; then \
-		other_owner=$$(find bin -xdev ! -uid "$$uid" -print -quit 2>/dev/null); \
-		find_status=$$?; \
-		if [ "$$find_status" -ne 0 ]; then \
-			echo "Leaving bin because its ownership could not be checked; inspect it as the owning user." >&2; \
-		elif [ -n "$$other_owner" ]; then \
-			echo "Leaving bin because it contains files not owned by uid $$uid; run make clean-all as their owner." >&2; \
-		else \
-			find bin -xdev -depth -delete || echo "Warning: failed to remove bin without crossing filesystem boundaries" >&2; \
-		fi; \
-	fi
+	-bash hack/clean_owned_path.sh bin
 
 # Remove E2E aux testcontainers (registry, git server, prometheus, jaeger, trustify) and their anonymous volumes so next e2e run starts fresh
 clean-aux:
-	test/scripts/runtime_preflight.sh clean
 	- podman rm -f -v e2e-registry e2e-registry-auth e2e-gitserver e2e-prometheus e2e-jaeger e2e-trustify-api e2e-trustify-db e2e-trustify-importer 2>/dev/null || true
 	- podman network rm e2e-trustify-net 2>/dev/null || true
 
 clean-quadlets:
-	deploy/scripts/clean_quadlets.sh
+	-deploy/scripts/clean_quadlets.sh
 
 clean-e2e-vms:
 	test/scripts/e2e_cleanup.sh

@@ -376,15 +376,19 @@ func configureInsecureRegistry(registryURL string) error {
 		}
 		configRoot = filepath.Join(configHome, "containers")
 	}
+	return writeInsecureRegistry(configRoot, registryURL)
+}
+
+func writeInsecureRegistry(configRoot, registryURL string) error {
 	registriesConfPath := filepath.Join(configRoot, "registries.conf.d", "flightctl-e2e.conf")
-	if existingConfig, err := os.ReadFile(registriesConfPath); err == nil && string(existingConfig) != "" {
-		return nil
-	}
 	config := fmt.Sprintf(`# Managed by Flight Control E2E; make clean removes this file.
 [[registry]]
 location = "%s"
 insecure = true
 `, registryURL)
+	if existingConfig, err := os.ReadFile(registriesConfPath); err == nil && string(existingConfig) == config {
+		return nil
+	}
 	if err := os.MkdirAll(filepath.Dir(registriesConfPath), 0755); err != nil {
 		return fmt.Errorf("create Podman registry config directory: %w", err)
 	}

@@ -181,8 +181,12 @@ for service in ${ALL_SERVICES}; do
 done
 
 echo ""
-if [[ ${EUID} -eq 0 ]]; then
-  echo "You can check status with: systemctl status flightctl.target"
-else
-  echo "You can check status with: systemctl --user status flightctl.target"
+systemctl_args=()
+api_port=443
+if [[ ${EUID} -ne 0 ]]; then
+    systemctl_args+=(--user)
+    api_port=9443
 fi
+printf 'You can check status with: systemctl %sstatus flightctl.target\n' "${systemctl_args[*]:+${systemctl_args[*]} }"
+api_host="$(python3 "${CONFIG_READONLY_DIR}/yaml_helpers.py" extract .global.baseDomain "${CONFIG_WRITEABLE_DIR}/service-config.yaml" --default localhost)"
+printf 'bin/flightctl login %q --web --certificate-authority %q\n' "https://${api_host}:${api_port}" "${CONFIG_WRITEABLE_DIR}/pki/ca.crt"

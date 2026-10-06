@@ -15,11 +15,10 @@ AddHost=%H:host-gateway
 Volume=%E/flightctl/flightctl-prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,z
 Volume=%E/flightctl/pki/flightctl-prometheus/server.crt:/root/.flightctl/certs/server.crt:ro,z
 Volume=%E/flightctl/pki/flightctl-prometheus/server.key:/root/.flightctl/certs/server.key:ro,z
-Volume=%S/prometheus:/prometheus:rw,z,U
 
 [Service]
 Restart=on-failure
 ExecStartPre=/usr/bin/env PATH=%D/flightctl/bin:/usr/bin:/bin flightctl-standalone render template --config %E/flightctl/service-config.yaml --input-file %D/flightctl/flightctl-prometheus/prometheus.yml --output-file %E/flightctl/flightctl-prometheus/prometheus.yml
 
 [Install]
-WantedBy=default.target
+WantedBy=flightctl-observability.target

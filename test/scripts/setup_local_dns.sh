@@ -28,8 +28,7 @@ kubectl rollout status deploy/coredns -n kube-system --timeout=60s
 
 # 3. Download the standalone CoreDNS binary for the host
 COREDNS_VERSION="1.14.7"
-COREDNS_DIR="/tmp/coredns-host"
-mkdir -p "${COREDNS_DIR}"
+COREDNS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/flightctl-coredns.XXXXXX")"
 curl -fsSL "https://github.com/coredns/coredns/releases/download/v${COREDNS_VERSION}/coredns_${COREDNS_VERSION}_linux_amd64.tgz" \
   | tar -xz -C "${COREDNS_DIR}"
 chmod +x "${COREDNS_DIR}/coredns"

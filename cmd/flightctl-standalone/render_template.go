@@ -144,10 +144,7 @@ func (o *RenderTemplateOptions) completeAAPConfig(global map[string]interface{})
 		return nil
 	}
 
-	clientIDFile := renderer.DefaultAAPClientIDPath
-	if o.Config != "" {
-		clientIDFile = filepath.Join(filepath.Dir(o.Config), "pki", "aap-client-id")
-	}
+	clientIDFile := filepath.Join(filepath.Dir(o.Config), "pki", "aap-client-id")
 	clientIDData, err := os.ReadFile(clientIDFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

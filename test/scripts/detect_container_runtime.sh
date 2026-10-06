@@ -55,7 +55,7 @@ detect_container_socket() {
 configure_testcontainers_docker_host() {
   local socket_path
 
-  if [[ -n "${DOCKER_HOST:-}" ]]; then
+  if [[ "$(id -u)" -eq 0 && -n "${DOCKER_HOST:-}" ]]; then
     return 0
   fi
 
@@ -67,11 +67,6 @@ configure_testcontainers_docker_host() {
 detect_testcontainers_runtime() {
   if [[ "${DOCKER_HOST:-}" == *podman* ]]; then
     printf '%s\n' podman
-    return 0
-  fi
-
-  if [[ -n "${DOCKER_HOST:-}" ]]; then
-    printf '%s\n' docker
     return 0
   fi
 
@@ -132,7 +127,7 @@ ensure_testcontainers_podman_runtime() {
     runtime="$(detect_testcontainers_runtime)"
   fi
 
-  if [[ "${runtime}" == "podman" && -n "${DOCKER_HOST:-}" && "${DOCKER_HOST}" != unix://* ]]; then
+  if [[ "$(id -u)" -eq 0 && "${runtime}" == "podman" && -n "${DOCKER_HOST:-}" && "${DOCKER_HOST}" != unix://* ]]; then
     export CONTAINER_HOST="${DOCKER_HOST}"
     return 0
   fi
@@ -149,6 +144,7 @@ ensure_testcontainers_podman_runtime() {
     return 1
   fi
 
+  stop_testcontainers_podman_service
   if ! TESTCONTAINERS_PODMAN_SERVICE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/flightctl-e2e-podman.XXXXXX")"; then
     echo "ERROR: failed to create a temporary directory for the Podman API socket"
     return 1

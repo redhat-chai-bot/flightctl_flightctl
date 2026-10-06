@@ -13,7 +13,7 @@ Secret=flightctl-postgresql-master-password,type=env,target=POSTGRESQL_MASTER_PA
 Secret=flightctl-postgresql-user-password,type=env,target=POSTGRESQL_PASSWORD
 # Note: Migrator password removed to prevent credential leakage - migrator user creation
 # is now handled by the migration service which has its own credentials
-Volume=/usr/share/flightctl/flightctl-db/enable-superuser.sh:/usr/share/container-scripts/postgresql/start/enable-superuser.sh
+Volume=%D/flightctl/flightctl-db/enable-superuser.sh:/usr/share/container-scripts/postgresql/start/enable-superuser.sh:ro
 
 [Service]
 Restart=always

@@ -467,7 +467,7 @@ imageBuilderWorker:
   # -- Expose /dev/kvm to the worker for native image-builder --in-vm exports
   kvmDevice:
     # -- Add the node's /dev/kvm device to the worker pod
-    enabled: false
+    enabled: true
   # -- Expose the host /sys, /dev, and /lib/modules paths required by rootful bootc-image-builder exports
   hostDevices:
     # -- Add the broad host device mounts required by rootful exports
@@ -491,7 +491,7 @@ imageBuilderWorker:
       # -- Set to true to skip TLS verification when pulling the Podman builder image.
       skipTlsVerify: false
     bootcImageBuilder:
-      # -- bootc-image-builder image (leave empty to use default).
+      # -- VM-compatible builder image. Empty uses the upstream default, which lacks VM dependencies; see docs/developer/rootless-deployment.md.
       image: ""
       # -- Set to true to skip TLS verification when pulling the bootc-image-builder image.
       skipTlsVerify: false

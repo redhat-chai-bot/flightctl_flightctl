@@ -2,16 +2,10 @@
 
 set -eo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/shared.sh"
+
 quadlet_dropin_root() {
-    if [[ -n "${QUADLET_SYSTEMD_DIR:-}" ]]; then
-        printf '%s\n' "$QUADLET_SYSTEMD_DIR"
-    elif [[ ${EUID} -eq 0 ]]; then
-        printf '%s\n' /etc/containers/systemd
-    else
-        local user_home="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
-        local xdg_config_home="${XDG_CONFIG_HOME:-${user_home}/.config}"
-        printf '%s\n' "${xdg_config_home}/containers/systemd"
-    fi
+    printf '%s\n' "$QUADLET_SYSTEMD_DIR"
 }
 
 # Generate a random password
@@ -44,7 +38,8 @@ ensure_kv_secrets() {
 ensure_delta_generation_secrets() {
     local username_secret="flightctl-delta-generation-default-repository-username"
     local password_secret="flightctl-delta-generation-default-repository-password"
-    local dropin_dir="$(quadlet_dropin_root)/flightctl-delta-worker.container.d"
+    local dropin_dir
+    dropin_dir="$(quadlet_dropin_root)/flightctl-delta-worker.container.d"
     local dropin_file="${dropin_dir}/delta-generation-repository.conf"
 
     if [[ -z "${DELTA_GENERATION_DEFAULT_REPOSITORY_USERNAME:-}" ||

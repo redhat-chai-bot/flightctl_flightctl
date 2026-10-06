@@ -386,7 +386,7 @@ For more detailed configuration options, see the [Values](#values) section below
 | imageBuilderApi.image.image | string | `"quay.io/flightctl/flightctl-imagebuilder-api-el9"` | ImageBuilder API container image |
 | imageBuilderApi.image.pullPolicy | string | `""` | Image pull policy for ImageBuilder API container |
 | imageBuilderApi.image.tag | string | `""` | ImageBuilder API image tag |
-| imageBuilderWorker | object | `{"defaultTTL":"168h","enabled":true,"hostDevices":{"enabled":true},"image":{"image":"quay.io/flightctl/flightctl-imagebuilder-worker-el9","pullPolicy":"","tag":""},"imageBuilderTimeout":"3m","kvmDevice":{"enabled":false},"logLevel":"info","maxConcurrentBuilds":2,"privileged":true,"replicas":1,"resources":{},"rhsmCaSecretName":"","rhsmSecretName":"","sbom":{"enabled":true,"purlTransform":{"enabled":true},"pushToRegistry":true,"uploadToTrustify":true},"serviceImages":{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false},"pullSecretName":"","syft":{"image":"","skipTlsVerify":false}},"timeoutCheckTaskInterval":"1m","yumReposSecretName":""}` | ImageBuilder Worker Configuration |
+| imageBuilderWorker | object | `{"defaultTTL":"168h","enabled":true,"hostDevices":{"enabled":true},"image":{"image":"quay.io/flightctl/flightctl-imagebuilder-worker-el9","pullPolicy":"","tag":""},"imageBuilderTimeout":"3m","kvmDevice":{"enabled":true},"logLevel":"info","maxConcurrentBuilds":2,"privileged":true,"replicas":1,"resources":{},"rhsmCaSecretName":"","rhsmSecretName":"","sbom":{"enabled":true,"purlTransform":{"enabled":true},"pushToRegistry":true,"uploadToTrustify":true},"serviceImages":{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false},"pullSecretName":"","syft":{"image":"","skipTlsVerify":false}},"timeoutCheckTaskInterval":"1m","yumReposSecretName":""}` | ImageBuilder Worker Configuration |
 | imageBuilderWorker.defaultTTL | string | `"168h"` | Default TTL for image build resources |
 | imageBuilderWorker.enabled | bool | `true` | Enable imagebuilder worker service |
 | imageBuilderWorker.hostDevices | object | `{"enabled":true}` | Expose the host /sys, /dev, and /lib/modules paths required by rootful bootc-image-builder exports |
@@ -395,7 +395,7 @@ For more detailed configuration options, see the [Values](#values) section below
 | imageBuilderWorker.image.pullPolicy | string | `""` | Image pull policy for ImageBuilder Worker container |
 | imageBuilderWorker.image.tag | string | `""` | ImageBuilder Worker image tag |
 | imageBuilderWorker.imageBuilderTimeout | string | `"3m"` | Inactivity timeout for image builds and exports |
-| imageBuilderWorker.kvmDevice.enabled | bool | `false` | Add the node's /dev/kvm device to the worker pod |
+| imageBuilderWorker.kvmDevice.enabled | bool | `true` | Add the node's /dev/kvm device to the worker pod |
 | imageBuilderWorker.logLevel | string | `"info"` | Log level for the imagebuilder worker |
 | imageBuilderWorker.maxConcurrentBuilds | int | `2` | Maximum number of concurrent image builds |
 | imageBuilderWorker.privileged | bool | `true` | Enable privileged mode for container-in-container builds |
@@ -409,7 +409,7 @@ For more detailed configuration options, see the [Values](#values) section below
 | imageBuilderWorker.sbom.pushToRegistry | bool | `true` | Attach the SBOM to the pushed image as an OCI 1.1 referrer artifact on the destination registry. |
 | imageBuilderWorker.sbom.uploadToTrustify | bool | `true` | Upload the SBOM to Trustify when vulnerability reporting is enabled and Trustify is configured (same settings as `vulnerabilityReporting` elsewhere in this chart). |
 | imageBuilderWorker.serviceImages | object | `{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false},"pullSecretName":"","syft":{"image":"","skipTlsVerify":false}}` | Builder images (podman, bootc-image-builder, syft) and skip-TLS options |
-| imageBuilderWorker.serviceImages.bootcImageBuilder.image | string | `""` | bootc-image-builder image (leave empty to use default). |
+| imageBuilderWorker.serviceImages.bootcImageBuilder.image | string | `""` | VM-compatible builder image. Empty uses the upstream default, which lacks VM dependencies; see docs/developer/rootless-deployment.md. |
 | imageBuilderWorker.serviceImages.bootcImageBuilder.skipTlsVerify | bool | `false` | Set to true to skip TLS verification when pulling the bootc-image-builder image. |
 | imageBuilderWorker.serviceImages.podman.image | string | `""` | Podman builder image (leave empty to use default). |
 | imageBuilderWorker.serviceImages.podman.skipTlsVerify | bool | `false` | Set to true to skip TLS verification when pulling the Podman builder image. |
