@@ -21,6 +21,7 @@ import (
 	enrollmentrequestservice "github.com/flightctl/flightctl/internal/service/enrollmentrequest"
 	"github.com/flightctl/flightctl/internal/service/events"
 	fleetservice "github.com/flightctl/flightctl/internal/service/fleet"
+	labelsyncmappingservice "github.com/flightctl/flightctl/internal/service/labelsyncmapping"
 	repositoryservice "github.com/flightctl/flightctl/internal/service/repository"
 	"github.com/flightctl/flightctl/internal/service/tpmcsr"
 	"github.com/flightctl/flightctl/internal/store"
@@ -33,6 +34,7 @@ import (
 	enrollmentrequeststore "github.com/flightctl/flightctl/internal/store/enrollmentrequest"
 	eventstore "github.com/flightctl/flightctl/internal/store/event"
 	fleetstore "github.com/flightctl/flightctl/internal/store/fleet"
+	labelsyncmappingstore "github.com/flightctl/flightctl/internal/store/labelsyncmapping"
 	"github.com/flightctl/flightctl/internal/store/model"
 	organizationstore "github.com/flightctl/flightctl/internal/store/organization"
 	repositorystore "github.com/flightctl/flightctl/internal/store/repository"
@@ -100,6 +102,7 @@ type ServiceTestSuite struct {
 	EnrollmentRequest         enrollmentrequestservice.Service
 	Fleet                     fleetservice.Service
 	EnrollmentHookPolicy      enrollmenthookpolicyservice.Service
+	LabelSyncMapping          labelsyncmappingservice.Service
 	Repository                repositoryservice.Service
 
 	OrgID uuid.UUID
@@ -179,6 +182,12 @@ func (s *ServiceTestSuite) Setup() {
 	s.CertificateSigningRequest = certificatesigningrequestservice.NewServiceHandler(csrStore, tpmcsr.NewVerifier(s.EnrollmentRequest), s.caClient, eventsSvc, s.Log, "", "")
 	s.Fleet = fleetservice.NewServiceHandler(fleetStore, catalogStore, eventsSvc, s.Log)
 	s.Repository = repositoryservice.NewServiceHandler(repositoryStore, eventsSvc, s.Log)
+
+	labelSyncMappingStore := labelsyncmappingstore.NewStore(s.DB, s.Log.WithField("pkg", "labelsyncmapping-store"))
+	labelSyncMappingEvaluator, err := labelsyncmappingservice.NewEvaluator()
+	Expect(err).ToNot(HaveOccurred())
+	s.LabelSyncMapping, err = labelsyncmappingservice.NewServiceHandler(labelSyncMappingStore, s.DeviceStore, labelSyncMappingEvaluator, eventsSvc, s.Log)
+	Expect(err).ToNot(HaveOccurred())
 
 	// Default org for integration tests
 	s.OrgID = store.NullOrgId
