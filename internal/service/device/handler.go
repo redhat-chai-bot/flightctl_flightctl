@@ -548,7 +548,14 @@ func applyDeviceStatusPatch(ctx context.Context, current *domain.Device, patch d
 	if errs := patched.Validate(); len(errs) > 0 {
 		return nil, errors.Join(errs...)
 	}
-	if !reflect.DeepEqual(patched.Metadata, current.Metadata) {
+	// Compare the serialized documents rather than the decoded Go values: the patch round
+	// trip can hand back a byte-different but document-identical value for fields it never
+	// touched. See common.EqualJSON for why.
+	metadataUnchanged, err := common.EqualJSON(current.Metadata, patched.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	if !metadataUnchanged {
 		return nil, errors.New("metadata is immutable")
 	}
 	if current.ApiVersion != patched.ApiVersion {
@@ -557,7 +564,11 @@ func applyDeviceStatusPatch(ctx context.Context, current *domain.Device, patch d
 	if current.Kind != patched.Kind {
 		return nil, errors.New("kind is immutable")
 	}
-	if !reflect.DeepEqual(current.Spec, patched.Spec) {
+	specUnchanged, err := common.EqualJSON(current.Spec, patched.Spec)
+	if err != nil {
+		return nil, err
+	}
+	if !specUnchanged {
 		return nil, errors.New("spec is immutable")
 	}
 	// EnrollmentHooks is service-owned and must not be changed through generic status patches.
