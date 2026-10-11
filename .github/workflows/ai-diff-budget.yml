@@ -1,0 +1,163 @@
+name: "AI diff budget"
+
+# Keeps pull requests reviewable by bounding the size of the cumulative diff.
+# See the "Scope discipline" section of AGENTS.md for the rationale and the
+# matching local checklist.
+#
+#   > 15 files or  500 changed lines -> warning comment, check still passes
+#   > 30 files or 1000 changed lines -> check fails
+#
+# A PR that legitimately exceeds the hard limit (large generated migrations,
+# vendored drops, mechanical renames agreed up front) can be unblocked with the
+# "override/diff-budget" label plus a justification in the PR body.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'release-*'
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  diff-budget:
+    name: Diff budget
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Measure the diff
+        id: measure
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Generated and vendored content is excluded: it is not hand-reviewed
+          # and would otherwise mask the size of the human-written change.
+          numstat() {
+            git diff --numstat "${BASE_SHA}" "${HEAD_SHA}" -- . \
+              ':!*.gen.go' ':!*.pb.go' ':!go.sum' ':!vendor/*'
+          }
+
+          FILES="$(numstat | wc -l | tr -d ' ')"
+          LINES="$(numstat | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { s += $1 + $2 } END { print s + 0 }')"
+
+          echo "files=${FILES}" >> "${GITHUB_OUTPUT}"
+          echo "lines=${LINES}" >> "${GITHUB_OUTPUT}"
+          echo "Non-generated diff: ${FILES} files, ${LINES} changed lines"
+
+          {
+            echo "### AI diff budget"
+            echo
+            echo "| Metric | Value | Warn | Hard stop |"
+            echo "|---|---|---|---|"
+            echo "| Files changed | ${FILES} | 15 | 30 |"
+            echo "| Lines changed | ${LINES} | 500 | 1000 |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Enforce the budget
+        uses: actions/github-script@v7
+        env:
+          FILES: ${{ steps.measure.outputs.files }}
+          LINES: ${{ steps.measure.outputs.lines }}
+        with:
+          script: |
+            const WARN_FILES = 15;
+            const WARN_LINES = 500;
+            const FAIL_FILES = 30;
+            const FAIL_LINES = 1000;
+            const OVERRIDE_LABEL = 'override/diff-budget';
+            const MARKER = '<!-- ai-diff-budget -->';
+
+            const files = Number(process.env.FILES);
+            const lines = Number(process.env.LINES);
+            const labels = context.payload.pull_request.labels.map((l) => l.name);
+            const overridden = labels.includes(OVERRIDE_LABEL);
+
+            const stat = `**${files} files / ${lines} changed lines** (generated files, \`go.sum\` and \`vendor/\` excluded)`;
+            const exceedsFail = files > FAIL_FILES || lines > FAIL_LINES;
+            const exceedsWarn = files > WARN_FILES || lines > WARN_LINES;
+
+            let body = null;
+            if (exceedsFail) {
+              body = [
+                MARKER,
+                `### Diff budget exceeded`,
+                ``,
+                `This PR changes ${stat}, over the hard limit of ${FAIL_FILES} files / ${FAIL_LINES} lines.`,
+                ``,
+                `Split it into reviewable PRs, or add the \`${OVERRIDE_LABEL}\` label and justify the size in the PR body.`,
+                `Before doing either, map every changed file to the request that required it — see the`,
+                `"Scope discipline" section of [AGENTS.md](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/${context.payload.pull_request.base.ref}/AGENTS.md).`,
+              ].join('\n');
+            } else if (exceedsWarn) {
+              body = [
+                MARKER,
+                `### Diff budget warning`,
+                ``,
+                `This PR changes ${stat}, over the warning threshold of ${WARN_FILES} files / ${WARN_LINES} lines`,
+                `(hard limit: ${FAIL_FILES} files / ${FAIL_LINES} lines).`,
+                ``,
+                `Please confirm in the PR body that every changed file is required by the stated request.`,
+              ].join('\n');
+            }
+
+            // Pull requests from forks get a read-only token, so commenting can
+            // fail. The diffstat is already in the step summary and in the check
+            // result; never fail the job over the comment itself.
+            if (body) {
+              try {
+                const { data: comments } = await github.rest.issues.listComments({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  per_page: 100,
+                });
+                const existing = comments.find((c) => c.body && c.body.includes(MARKER));
+                if (existing) {
+                  await github.rest.issues.updateComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: existing.id,
+                    body,
+                  });
+                } else {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: context.payload.pull_request.number,
+                    body,
+                  });
+                }
+              } catch (e) {
+                core.warning(`Could not post the diff-budget comment: ${e.message}`);
+              }
+            }
+
+            if (exceedsFail && !overridden) {
+              core.setFailed(
+                `Diff budget exceeded: ${files} files / ${lines} lines (limit ${FAIL_FILES} / ${FAIL_LINES}). ` +
+                `Split the PR or add the "${OVERRIDE_LABEL}" label.`,
+              );
+              return;
+            }
+            if (exceedsFail) {
+              core.warning(`Diff budget exceeded but overridden by the "${OVERRIDE_LABEL}" label.`);
+              return;
+            }
+            if (exceedsWarn) {
+              core.warning(`Diff above the warning threshold: ${files} files / ${lines} lines.`);
+              return;
+            }
+            console.log(`Within budget: ${files} files / ${lines} changed lines.`);

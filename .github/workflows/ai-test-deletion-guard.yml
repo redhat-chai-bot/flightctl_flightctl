@@ -1,0 +1,177 @@
+name: "AI test deletion guard"
+
+# Tests are the durable record of what the code is supposed to do. A refactor
+# that deletes them to make itself pass is a silent regression, and that is
+# exactly how a large assistant-driven change removes coverage without anyone
+# noticing.
+#
+# This check counts removed lines in *_test.go files. Above 50 removed test
+# lines it fails and lists the deleted test functions, so the removal has to be
+# acknowledged explicitly with the "override/test-deletion" label and explained
+# per test in the PR body.
+#
+# See the "Scope discipline" section of AGENTS.md for the matching local
+# checklist.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'release-*'
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test-deletion:
+    name: Test deletion guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Measure removed test lines
+        id: measure
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          NUMSTAT="$(git diff --numstat "${BASE_SHA}" "${HEAD_SHA}" -- '*_test.go')"
+          ADDED="$(printf '%s\n' "${NUMSTAT}" | awk '$1 ~ /^[0-9]+$/ { s += $1 } END { print s + 0 }')"
+          REMOVED="$(printf '%s\n' "${NUMSTAT}" | awk '$2 ~ /^[0-9]+$/ { s += $2 } END { print s + 0 }')"
+
+          # Test functions whose definition line disappears from the diff. A
+          # renamed test shows up here too, which is intentional: a renamed
+          # assertion is still a changed contract and deserves a sentence.
+          git diff "${BASE_SHA}" "${HEAD_SHA}" -- '*_test.go' \
+            | grep -E '^-func (Test|Benchmark|Fuzz|Example)' \
+            | sed -E 's/^-func ([A-Za-z0-9_]+).*/\1/' \
+            | sort -u > "${RUNNER_TEMP}/removed-tests.txt" || true
+
+          echo "added=${ADDED}" >> "${GITHUB_OUTPUT}"
+          echo "removed=${REMOVED}" >> "${GITHUB_OUTPUT}"
+          echo "Test lines: +${ADDED} / -${REMOVED}"
+
+          {
+            echo "### AI test deletion guard"
+            echo
+            echo "Test lines added: \`${ADDED}\`, removed: \`${REMOVED}\` (threshold: 50 removed)."
+            if [ -s "${RUNNER_TEMP}/removed-tests.txt" ]; then
+              echo
+              echo "Removed or renamed test functions:"
+              echo
+              sed -e 's/^/- `/' -e 's/$/`/' "${RUNNER_TEMP}/removed-tests.txt"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Enforce acknowledgment
+        uses: actions/github-script@v7
+        env:
+          ADDED: ${{ steps.measure.outputs.added }}
+          REMOVED: ${{ steps.measure.outputs.removed }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const THRESHOLD = 50;
+            const OVERRIDE_LABEL = 'override/test-deletion';
+            const MARKER = '<!-- ai-test-deletion-guard -->';
+
+            const added = Number(process.env.ADDED);
+            const removed = Number(process.env.REMOVED);
+            const labels = context.payload.pull_request.labels.map((l) => l.name);
+            const acknowledged = labels.includes(OVERRIDE_LABEL);
+
+            if (removed <= THRESHOLD) {
+              console.log(`Test lines +${added} / -${removed}: within the ${THRESHOLD}-line threshold.`);
+              return;
+            }
+
+            let removedTests = '';
+            try {
+              removedTests = fs
+                .readFileSync(path.join(process.env.RUNNER_TEMP, 'removed-tests.txt'), 'utf8')
+                .split('\n')
+                .map((name) => name.trim())
+                .filter((name) => name.length > 0)
+                .map((name) => `- \`${name}\``)
+                .join('\n');
+            } catch (e) {
+              removedTests = '';
+            }
+
+            const lines = [
+              MARKER,
+              `### ${removed} test lines removed`,
+              ``,
+              `This PR changes \`*_test.go\` files by **+${added} / -${removed}** lines, over the ` +
+                `${THRESHOLD}-line deletion threshold.`,
+              ``,
+            ];
+            if (removedTests) {
+              lines.push(`Test functions removed or renamed:`, ``, removedTests, ``);
+            } else {
+              lines.push(
+                `No whole test function was removed — the deletions are inside existing tests. ` +
+                  `Say what coverage changed anyway.`,
+                ``,
+              );
+            }
+            lines.push(
+              `Explain **per test** why the behaviour it asserted no longer needs asserting, then add the ` +
+                `\`${OVERRIDE_LABEL}\` label to acknowledge the removal. "Replaced obsolete tests" is not an ` +
+                `explanation.`,
+            );
+            if (acknowledged) {
+              lines.push(``, `Acknowledged via the \`${OVERRIDE_LABEL}\` label.`);
+            }
+            const body = lines.join('\n');
+
+            // Pull requests from forks get a read-only token, so commenting can
+            // fail. The finding is already in the step summary and in the check
+            // result; never fail the job over the comment itself.
+            try {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                per_page: 100,
+              });
+              const existing = comments.find((c) => c.body && c.body.includes(MARKER));
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  body,
+                });
+              }
+            } catch (e) {
+              core.warning(`Could not post the test-deletion comment: ${e.message}`);
+            }
+
+            if (!acknowledged) {
+              core.setFailed(
+                `${removed} test lines removed (threshold ${THRESHOLD}). Justify each removal in the PR body ` +
+                `and add the "${OVERRIDE_LABEL}" label.`,
+              );
+              return;
+            }
+            core.warning(`${removed} test lines removed, acknowledged by the "${OVERRIDE_LABEL}" label.`);
