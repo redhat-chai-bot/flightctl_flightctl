@@ -210,6 +210,10 @@ func StoreErrorToApiStatus(err error, created bool, kind string, name *string) d
 	}
 
 	switch {
+	case errors.Is(err, flterrors.ErrEnrollmentCredentialRetained):
+		status := domain.StatusConflict(err.Error())
+		status.Reason = "EnrollmentCredentialRetained"
+		return status
 	case errors.Is(err, flterrors.ErrResourceNotFound):
 		return domain.StatusResourceNotFound(kind, util.DefaultIfNil(name, "none"))
 	case badRequestErrors[err]:

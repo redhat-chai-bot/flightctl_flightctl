@@ -30,6 +30,7 @@ import (
 	catalogservice "github.com/flightctl/flightctl/internal/service/catalog"
 	certificatesigningrequestservice "github.com/flightctl/flightctl/internal/service/certificatesigningrequest"
 	deviceservice "github.com/flightctl/flightctl/internal/service/device"
+	enrollmentapprovalpolicyservice "github.com/flightctl/flightctl/internal/service/enrollmentapprovalpolicy"
 	enrollmentconfigservice "github.com/flightctl/flightctl/internal/service/enrollmentconfig"
 	enrollmenthookpolicyservice "github.com/flightctl/flightctl/internal/service/enrollmenthookpolicy"
 	enrollmentrequestservice "github.com/flightctl/flightctl/internal/service/enrollmentrequest"
@@ -48,6 +49,7 @@ import (
 	catalogstore "github.com/flightctl/flightctl/internal/store/catalog"
 	certificatesigningrequeststore "github.com/flightctl/flightctl/internal/store/certificatesigningrequest"
 	devicestore "github.com/flightctl/flightctl/internal/store/device"
+	enrollmentapprovalpolicystore "github.com/flightctl/flightctl/internal/store/enrollmentapprovalpolicy"
 	enrollmenthooknotifysecretsstore "github.com/flightctl/flightctl/internal/store/enrollmenthooknotifysecrets"
 	enrollmenthookpolicystore "github.com/flightctl/flightctl/internal/store/enrollmenthookpolicy"
 	enrollmentrequeststore "github.com/flightctl/flightctl/internal/store/enrollmentrequest"
@@ -228,6 +230,8 @@ func (s *Server) Run(ctx context.Context) error {
 	enrollmentHookPolicyStore := enrollmenthookpolicystore.NewStore(s.db, s.log.WithField("pkg", "enrollmenthookpolicy-store"))
 	enrollmentHookPolicySvc := enrollmenthookpolicyservice.WrapWithTracing(
 		enrollmenthookpolicyservice.NewServiceHandler(enrollmentHookPolicyStore, eventsSvc, s.log))
+	enrollmentApprovalPolicySvc := enrollmentapprovalpolicyservice.WrapWithTracing(
+		enrollmentapprovalpolicyservice.NewServiceHandler(enrollmentapprovalpolicystore.NewStore(s.db, s.log), enrollmentapprovalpolicyservice.UnavailablePolicySetValidator{}, s.cfg.CA.DeviceEnrollmentSignerName, eventsSvc, s.log))
 	notifySecretsStore := enrollmenthooknotifysecretsstore.NewStore(s.db, s.log.WithField("pkg", "enrollmenthooknotifysecrets-store"))
 
 	var tpmVerifier tpmcsr.Verifier
@@ -339,6 +343,7 @@ func (s *Server) Run(ctx context.Context) error {
 		fleetSvc, organizationSvc, repositorySvc, resourceSyncSvc, templateVersionSvc,
 		convertv1beta1.NewConverter(),
 		s.authN, authTokenProxy, authUserInfoProxy, s.authZ,
+		enrollmentApprovalPolicySvc,
 	)
 
 	// Create v1beta1 router with OpenAPI validation

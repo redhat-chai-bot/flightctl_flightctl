@@ -22,6 +22,35 @@ Resources in flightctl are modeled after Kubernetes resources.  Each resource ha
 * spec: The desired state of the object.
 * status: The current state of the object.
 
+## Enrollment approval policies
+
+The `EnrollmentApprovalPolicy` resource stores administrator-owned enrollment
+policy configuration for one tenant-local enrollment credential. It includes
+an opt-in `enabled` flag, immutable `certificateName`, `requireTPMVerification`,
+`matchExpression`, static `deviceLabels`, and optional `allowedIncomingLabels`.
+The optional `approvalLimit` is a nonnegative lifetime limit; omission or null
+means unlimited, while zero prevents automatic approvals. The optional
+`autoApprovalWindowDays` is between 1 and 106751 days and requires authoritative
+certificate issuance time.
+
+Use `/api/v1/enrollmentapprovalpolicies` for collection reads and creation, and
+`/api/v1/enrollmentapprovalpolicies/<name>` for reads, replacement, patching, and
+deletion. Replacement requires the current `metadata.resourceVersion`. JSON
+Patch requires a test of `/metadata/resourceVersion`. Policy administration
+requires administrator permissions; approval-limit changes also require
+`update` permission on `enrollmentapprovalpolicies/approvallimit`.
+
+The read-only `/api/v1/enrollmentapprovalpolicies/<name>/status` endpoint returns
+`enrollmentCount`, initially zero. Clients cannot supply or patch status.
+Deleting a policy retains its accounting and certificate binding for audit;
+the policy name cannot be reused to reset accounting.
+
+Restricted expression validation is an integration dependency. Until semantic
+validation is available, policy mutations return `503 PolicyValidationUnavailable`
+without committing changes, including mutations of disabled drafts. Resource
+availability does not enable automatic enrollment approval. This resource
+foundation does not evaluate expressions or enforce admission quotas or windows.
+
 ## API Versioning
 
 Flight Control uses header-based API version negotiation. This allows clients to request specific API versions without changing endpoint URLs.

@@ -1,10 +1,118 @@
 package cli
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	api "github.com/flightctl/flightctl/api/core/v1beta1"
+	apiclient "github.com/flightctl/flightctl/internal/api/client"
+	"github.com/flightctl/flightctl/internal/client"
 	"github.com/stretchr/testify/require"
 )
+
+func TestApplyApprovalPolicyPreservesApprovalLimit(t *testing.T) {
+	for _, format := range []string{"direct", "json", "yaml"} {
+		t.Run(format, func(t *testing.T) {
+			var received int64
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				var body api.EnrollmentApprovalPolicy
+				require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+				require.NotNil(t, body.Spec.ApprovalLimit)
+				received = *body.Spec.ApprovalLimit
+				writer.Header().Set("Content-Type", "application/json")
+				writer.WriteHeader(http.StatusCreated)
+				_, _ = writer.Write([]byte(`{}`))
+			}))
+			defer server.Close()
+			generated, err := apiclient.NewClientWithResponses(server.URL)
+			require.NoError(t, err)
+			testClient := client.NewTestClient(generated)
+			document := `{"apiVersion":"flightctl.io/v1beta1","kind":"EnrollmentApprovalPolicy","metadata":{"name":"west"},"spec":{"approvalLimit":9223372036854775807}}`
+			if format == "direct" {
+				result := applyResourceByKind(t.Context(), testClient, nil, EnrollmentApprovalPolicyKind, "west", []byte(document))
+				require.NoError(t, result.err)
+			} else {
+				if format == "yaml" {
+					document = "apiVersion: flightctl.io/v1beta1\nkind: EnrollmentApprovalPolicy\nmetadata:\n  name: west\nspec:\n  approvalLimit: 9223372036854775807\n"
+				}
+				require.Empty(t, applyFromReader(t.Context(), testClient, nil, "policy", strings.NewReader(document), false))
+			}
+			require.Equal(t, int64(9223372036854775807), received)
+		})
+	}
+}
+
+func TestApplyApprovalPolicyUsesResourceVersionAndOmitsStatus(t *testing.T) {
+	for _, suppliedVersion := range []string{"", "2"} {
+		t.Run(suppliedVersion, func(t *testing.T) {
+			var methods []string
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				methods = append(methods, request.Method)
+				writer.Header().Set("Content-Type", "application/json")
+				switch request.Method {
+				case http.MethodPost:
+					var body map[string]any
+					require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+					require.NotContains(t, body, "status")
+					writer.WriteHeader(http.StatusConflict)
+					_, _ = writer.Write([]byte(`{}`))
+				case http.MethodGet:
+					_, _ = writer.Write([]byte(`{"metadata":{"name":"west","resourceVersion":"7"}}`))
+				case http.MethodPut:
+					var body api.EnrollmentApprovalPolicy
+					require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+					require.Nil(t, body.Status)
+					expected := suppliedVersion
+					if expected == "" {
+						expected = "7"
+					}
+					require.Equal(t, expected, *body.Metadata.ResourceVersion)
+					writer.WriteHeader(http.StatusOK)
+					_, _ = writer.Write([]byte(`{}`))
+				}
+			}))
+			defer server.Close()
+			generated, err := apiclient.NewClientWithResponses(server.URL)
+			require.NoError(t, err)
+			body := []byte(`{"metadata":{"name":"west","resourceVersion":"` + suppliedVersion + `"},"status":{"enrollmentCount":5}}`)
+			result := applyResourceByKind(t.Context(), client.NewTestClient(generated), nil, EnrollmentApprovalPolicyKind, "west", body)
+			require.NoError(t, result.err)
+			if suppliedVersion == "" {
+				require.Equal(t, []string{"POST", "GET", "PUT"}, methods)
+			} else {
+				require.Equal(t, []string{"POST", "PUT"}, methods)
+			}
+		})
+	}
+}
+
+func TestApplyApprovalPolicyReturnsLookupFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.Method {
+		case http.MethodPost:
+			writer.WriteHeader(http.StatusConflict)
+			_, _ = writer.Write([]byte(`{}`))
+		case http.MethodGet:
+			writer.WriteHeader(http.StatusNotFound)
+			_, _ = writer.Write([]byte(`{"code":404,"reason":"NotFound","message":"policy not found"}`))
+		default:
+			t.Errorf("unexpected method %s", request.Method)
+		}
+	}))
+	defer server.Close()
+	generated, err := apiclient.NewClientWithResponses(server.URL)
+	require.NoError(t, err)
+	result := applyResourceByKind(t.Context(), client.NewTestClient(generated), nil, EnrollmentApprovalPolicyKind, "west", []byte(`{"metadata":{"name":"west"}}`))
+	require.NoError(t, result.err)
+	require.NotNil(t, result.httpResponse)
+	require.Equal(t, http.StatusNotFound, result.httpResponse.StatusCode)
+	require.NotNil(t, result.status)
+	require.Equal(t, int32(404), result.status.Code)
+}
 
 func TestApplySingleResourceEmptyName(t *testing.T) {
 	tests := []struct {
