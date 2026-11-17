@@ -43,10 +43,14 @@ func (policyAPIValidator) ValidatePolicySet(context.Context, *domain.EnrollmentA
 
 type policyAPIAuthorizer struct {
 	auth.AuthZMiddleware
-	static *authz.StaticAuthZ
+	static    *authz.StaticAuthZ
+	denyQuota bool
 }
 
 func (authorizer policyAPIAuthorizer) CheckPermission(ctx context.Context, resource, operation string) (bool, error) {
+	if authorizer.denyQuota && resource == "enrollmentapprovalpolicies/approvallimit" {
+		return false, nil
+	}
 	return authorizer.static.CheckPermission(ctx, resource, operation)
 }
 
@@ -65,9 +69,12 @@ var _ = Describe("EnrollmentApprovalPolicyAPI", func() {
 		Expect(suite.DB.Create(&model.CertificateSigningRequest{Resource: model.Resource{OrgID: suite.OrgID, Name: "commissioning"}, Spec: model.MakeJSONField(domain.CertificateSigningRequestSpec{SignerName: suite.cfg.CA.DeviceEnrollmentSignerName}), Status: model.MakeJSONField(domain.CertificateSigningRequestStatus{Certificate: &issued, IssuedAt: lo.ToPtr(time.Now())})}).Error).To(Succeed())
 	})
 	AfterEach(func() { suite.Teardown() })
-	makeHandler := func(validator policyservice.PolicySetValidator) http.Handler {
+	makeHandler := func(validator policyservice.PolicySetValidator, denyQuota ...bool) http.Handler {
 		policies := policyservice.NewServiceHandler(policystore.NewStore(suite.DB, suite.Log), validator, suite.cfg.CA.DeviceEnrollmentSignerName, nil, suite.Log)
 		authorizer := policyAPIAuthorizer{static: authz.NewStaticAuthZ(suite.Log)}
+		if len(denyQuota) != 0 {
+			authorizer.denyQuota = denyQuota[0]
+		}
 		handler := transport.NewTransportHandler(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, convert.NewConverter(), nil, nil, nil, authorizer, policies)
 		router := chi.NewRouter()
 		router.Use(auth.CreateAuthZMiddleware(authorizer, suite.Log))
@@ -84,6 +91,61 @@ var _ = Describe("EnrollmentApprovalPolicyAPI", func() {
 		return response
 	}
 	policyJSON := []byte(`{"apiVersion":"v1beta1","kind":"EnrollmentApprovalPolicy","metadata":{"name":"west"},"spec":{"certificateName":"commissioning","matchExpression":"true","deviceLabels":{}}}`)
+	It("When quota permission is denied it should reject quota mutations and unsupported source operations without writes", func() {
+		privileged := makeHandler(policyAPIValidator{})
+		limited := makeHandler(policyAPIValidator{}, true)
+		response := request(privileged, http.MethodPost, "", policyJSON, suite.Ctx)
+		Expect(response.Code).To(Equal(201), response.Body.String())
+		var created api.EnrollmentApprovalPolicy
+		Expect(json.Unmarshal(response.Body.Bytes(), &created)).To(Succeed())
+		patch := func(handler http.Handler, operation string) *httptest.ResponseRecorder {
+			body := []byte(`[{"op":"test","path":"/metadata/resourceVersion","value":"` + *created.Metadata.ResourceVersion + `"},` + operation + `]`)
+			req := httptest.NewRequest(http.MethodPatch, "/api/v1/enrollmentapprovalpolicies/west", bytes.NewReader(body)).WithContext(suite.Ctx)
+			req.Header.Set("Content-Type", "application/json-patch+json")
+			result := httptest.NewRecorder()
+			handler.ServeHTTP(result, req)
+			return result
+		}
+		response = patch(privileged, `{"op":"add","path":"/spec/approvalLimit","value":10}`)
+		Expect(response.Code).To(Equal(200), response.Body.String())
+		Expect(json.Unmarshal(response.Body.Bytes(), &created)).To(Succeed())
+		before := request(limited, http.MethodGet, "/west", nil, suite.Ctx).Body.String()
+		for _, operation := range []string{
+			`{"op":"add","path":"/spec/approvalLimit","value":12}`,
+			`{"op":"replace","path":"/spec/approvalLimit","value":12}`,
+			`{"op":"remove","path":"/spec/approvalLimit"}`,
+			`{"op":"replace","path":"/spec","value":{"certificateName":"commissioning","matchExpression":"true","deviceLabels":{}}}`,
+		} {
+			response = patch(limited, operation)
+			Expect(response.Code).To(Equal(403), response.Body.String())
+			Expect(request(limited, http.MethodGet, "/west", nil, suite.Ctx).Body.String()).To(Equal(before))
+		}
+		for _, operation := range []string{
+			`{"op":"move","from":"/spec/approvalLimit","path":"/spec/autoApprovalWindowDays"}`,
+			`{"op":"copy","from":"/spec/approvalLimit","path":"/spec/autoApprovalWindowDays"}`,
+		} {
+			response = patch(limited, operation)
+			Expect(response.Code).To(Equal(400), response.Body.String())
+			Expect(request(limited, http.MethodGet, "/west", nil, suite.Ctx).Body.String()).To(Equal(before))
+		}
+		response = patch(limited, `{"op":"add","path":"/spec/autoApprovalWindowDays","value":10}`)
+		Expect(response.Code).To(Equal(200), response.Body.String())
+		Expect(json.Unmarshal(response.Body.Bytes(), &created)).To(Succeed())
+		Expect(*created.Spec.ApprovalLimit).To(Equal(int64(10)))
+		response = patch(privileged, `{"op":"replace","path":"/spec/approvalLimit","value":9223372036854775807}`)
+		Expect(response.Code).To(Equal(200), response.Body.String())
+		Expect(json.Unmarshal(response.Body.Bytes(), &created)).To(Succeed())
+		Expect(*created.Spec.ApprovalLimit).To(Equal(int64(9223372036854775807)))
+		before = request(privileged, http.MethodGet, "/west", nil, suite.Ctx).Body.String()
+		for _, operation := range []string{
+			`{"op":"replace","path":"/spec/approvalLimit","value":9223372036854775808}`,
+			`{"op":"add","path":"/spec/unknown","value":true}`,
+		} {
+			response = patch(privileged, operation)
+			Expect(response.Code).To(Equal(400), response.Body.String())
+			Expect(request(privileged, http.MethodGet, "/west", nil, suite.Ctx).Body.String()).To(Equal(before))
+		}
+	})
 	It("When real validation is unavailable it should return 503 without storing even a disabled draft", func() {
 		handler := makeHandler(policyservice.UnavailablePolicySetValidator{})
 		response := request(handler, http.MethodPost, "", policyJSON, suite.Ctx)
@@ -99,6 +161,13 @@ var _ = Describe("EnrollmentApprovalPolicyAPI", func() {
 		Expect(json.Unmarshal(response.Body.Bytes(), &created)).To(Succeed())
 		Expect(created.Status).NotTo(BeNil())
 		Expect(created.Status.EnrollmentCount).To(Equal(int64(0)))
+		response = request(handler, http.MethodGet, "?limit=1&fieldSelector=metadata.name%3Dwest", nil, suite.Ctx)
+		Expect(response.Code).To(Equal(200), response.Body.String())
+		var listed api.EnrollmentApprovalPolicyList
+		Expect(json.Unmarshal(response.Body.Bytes(), &listed)).To(Succeed())
+		Expect(listed.Items).To(HaveLen(1))
+		Expect(listed.Items[0].Metadata.Name).To(Equal(created.Metadata.Name))
+		Expect(listed.Items[0].Status.EnrollmentCount).To(Equal(int64(0)))
 		response = request(handler, http.MethodGet, "?fieldSelector=spec.unknown%3Dx", nil, suite.Ctx)
 		Expect(response.Code).To(Equal(400), response.Body.String())
 		response = request(handler, http.MethodGet, "/west/status", nil, suite.Ctx)
@@ -108,6 +177,10 @@ var _ = Describe("EnrollmentApprovalPolicyAPI", func() {
 		foreignContext := util.WithOrganizationID(suite.Ctx, uuid.New())
 		Expect(request(handler, http.MethodGet, "/west", nil, foreignContext).Code).To(Equal(404))
 		Expect(request(handler, http.MethodGet, "/west/status", nil, foreignContext).Code).To(Equal(404))
+		response = request(handler, http.MethodGet, "", nil, foreignContext)
+		Expect(response.Code).To(Equal(200), response.Body.String())
+		Expect(json.Unmarshal(response.Body.Bytes(), &listed)).To(Succeed())
+		Expect(listed.Items).To(BeEmpty())
 		created.Status = nil
 		created.Spec.Enabled = true
 		changed, err := json.Marshal(created)

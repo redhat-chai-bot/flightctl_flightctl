@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/flightctl/flightctl/internal/config"
 	"github.com/flightctl/flightctl/internal/domain"
@@ -174,6 +175,24 @@ var _ = Describe("EnrollmentApprovalPolicyStore", func() {
 			Expect(first).To(MatchError(flterrors.ErrResourceVersionConflict))
 			Expect(second).NotTo(HaveOccurred())
 		}
+	})
+	It("When a bound credential is revoked it should retain policy accounting and deletion protection", func() {
+		_, err := create("west", nil)
+		Expect(err).NotTo(HaveOccurred())
+		credentials := csrstore.NewCertificateSigningRequestStore(db, log, "enrollment")
+		updated, before, created, err := credentials.Mutate(ctx, orgID, "credential", nil, func(mutation *csrstore.CertificateSigningRequestMutation) error {
+			return mutation.ApplyRevocation(domain.EnrollmentCertificateRevocation{Reason: "credential retired", RevokedAt: time.Now().UTC(), RevokedBy: "administrator"})
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(created).To(BeFalse())
+		Expect(before.Status.HasRevocation()).To(BeFalse())
+		Expect(updated.Status.HasRevocation()).To(BeTrue())
+		policy, err := policies.Get(ctx, orgID, "west")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(policy.Spec.CertificateName).To(Equal("credential"))
+		Expect(policy.Status.EnrollmentCount).To(Equal(int64(0)))
+		_, err = credentials.Delete(ctx, orgID, "credential")
+		Expect(err).To(MatchError(flterrors.ErrEnrollmentCredentialRetained))
 	})
 	It("When binding creation races credential deletion it should never leave an orphan", func() {
 		credentials := csrstore.NewCertificateSigningRequestStore(db, log, "enrollment")

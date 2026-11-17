@@ -284,10 +284,6 @@ func (s *CertificateSigningRequestStore) Mutate(ctx context.Context, orgId uuid.
 		})
 		return updated, before, created, err
 	}
-	if err := s.guardPolicyBinding(s.getDB(ctx), orgId, name, false); err != nil {
-		return nil, nil, false, err
-	}
-
 	if previous != nil && lo.FromPtr(previous.Metadata.Name) != name {
 		previous = nil
 	}
@@ -313,10 +309,8 @@ func (s *CertificateSigningRequestStore) persistMutation(ctx context.Context, or
 	if before.Metadata.CreationTimestamp == nil {
 		return false, flterrors.ErrResourceVersionConflict
 	}
-	if !reflect.DeepEqual(before.Spec, mutation.Resource().Spec) {
-		if err := s.guardPolicyBinding(s.getDB(ctx), orgId, name, true); err != nil {
-			return false, err
-		}
+	if err := s.guardPolicyBinding(s.getDB(ctx), orgId, name, !reflect.DeepEqual(before.Spec, mutation.Resource().Spec)); err != nil {
+		return false, err
 	}
 	record, err := certificateSigningRequestToModel(before, s.enrollmentSignerName)
 	if err != nil {

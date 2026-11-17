@@ -90,14 +90,19 @@ func (validator *testPolicyValidator) ValidatePolicySet(_ context.Context, candi
 	return validator.err
 }
 
-func policyFixture(t *testing.T) (*policyMemoryStore, domain.EnrollmentApprovalPolicy) {
+func policyCertificate(t *testing.T, notBefore, notAfter time.Time) []byte {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
-	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: notBefore, NotAfter: notAfter}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	require.NoError(t, err)
-	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func policyFixture(t *testing.T) (*policyMemoryStore, domain.EnrollmentApprovalPolicy) {
+	t.Helper()
+	certificate := policyCertificate(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
 	memory := &policyMemoryStore{orgID: uuid.New(), credential: &domain.CertificateSigningRequest{Spec: domain.CertificateSigningRequestSpec{SignerName: "enrollment"}, Status: &domain.CertificateSigningRequestStatus{Certificate: &certificate}}}
 	return memory, domain.EnrollmentApprovalPolicy{Metadata: domain.ObjectMeta{Name: lo.ToPtr("west")}, Spec: domain.EnrollmentApprovalPolicySpec{CertificateName: "credential", MatchExpression: "true", DeviceLabels: map[string]string{}}}
 }
@@ -195,6 +200,24 @@ func TestPolicyCredentialValidation(t *testing.T) {
 		{"When certificate is unissued it should reject", func(memory *policyMemoryStore, _ *domain.EnrollmentApprovalPolicy) {
 			memory.credential.Status.Certificate = nil
 		}},
+		{"When credential status is absent it should reject", func(memory *policyMemoryStore, _ *domain.EnrollmentApprovalPolicy) {
+			memory.credential.Status = nil
+		}},
+		{"When credential is revoked it should reject", func(memory *policyMemoryStore, _ *domain.EnrollmentApprovalPolicy) {
+			memory.credential.Status.Revocation = &domain.EnrollmentCertificateRevocation{}
+		}},
+		{"When certificate PEM is malformed it should reject", func(memory *policyMemoryStore, _ *domain.EnrollmentApprovalPolicy) {
+			memory.credential.Status.Certificate = lo.ToPtr([]byte("invalid certificate"))
+		}},
+		{"When certificate DER is malformed it should reject", func(memory *policyMemoryStore, _ *domain.EnrollmentApprovalPolicy) {
+			memory.credential.Status.Certificate = lo.ToPtr(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("invalid DER")}))
+		}},
+		{"When certificate has expired it should reject", func(memory *policyMemoryStore, _ *domain.EnrollmentApprovalPolicy) {
+			memory.credential.Status.Certificate = lo.ToPtr(policyCertificate(t, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour)))
+		}},
+		{"When certificate is not yet valid it should reject", func(memory *policyMemoryStore, _ *domain.EnrollmentApprovalPolicy) {
+			memory.credential.Status.Certificate = lo.ToPtr(policyCertificate(t, time.Now().Add(time.Hour), time.Now().Add(2*time.Hour)))
+		}},
 		{"When window has no issuance time it should reject", func(_ *policyMemoryStore, policy *domain.EnrollmentApprovalPolicy) {
 			policy.Spec.AutoApprovalWindowDays = lo.ToPtr(int32(1))
 		}},
@@ -207,6 +230,26 @@ func TestPolicyCredentialValidation(t *testing.T) {
 			_, status := service.CreateEnrollmentApprovalPolicy(context.Background(), memory.orgID, policy)
 			require.Equal(t, int32(400), status.Code)
 			require.Zero(t, memory.writes)
+		})
+	}
+}
+
+func TestPolicyPatchProtectsStatusAndMetadata(t *testing.T) {
+	for _, path := range []string{"/status", "/status/enrollmentCount", "/metadata", "/metadata/name", "/metadata/resourceVersion", "/kind", "/apiVersion", ""} {
+		t.Run(path, func(t *testing.T) {
+			memory, policy := policyFixture(t)
+			policy.Metadata.ResourceVersion = lo.ToPtr("1")
+			policy.Status = &domain.EnrollmentApprovalPolicyStatus{EnrollmentCount: 9}
+			memory.policy = &policy
+			service := policyservice.NewServiceHandler(memory, &testPolicyValidator{}, "enrollment", nil, logrus.New())
+			_, status := service.PatchEnrollmentApprovalPolicy(t.Context(), memory.orgID, "west", domain.PatchRequest{
+				{Op: "test", Path: "/metadata/resourceVersion", Value: "1"},
+				{Op: "remove", Path: path},
+			})
+			require.Equal(t, int32(400), status.Code)
+			require.Equal(t, "ProtectedField", status.Reason)
+			require.Zero(t, memory.writes)
+			require.Equal(t, int64(9), memory.policy.Status.EnrollmentCount)
 		})
 	}
 }
